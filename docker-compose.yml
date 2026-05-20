@@ -1,16 +1,13 @@
-version: '3.8'
-
 services:
-  # --- 1. База данных PostgreSQL ---
   db:
     image: postgres:15
     container_name: pii_guard_db
     environment:
       POSTGRES_DB: testdb
       POSTGRES_USER: admin
-      POSTGRES_PASSWORD: secret_password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret_password}
     ports:
-      - "5434:5432" # Прокидываем наружу на 5433, чтобы не конфликтовать с локальным PG
+      - "5434:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -19,27 +16,32 @@ services:
       timeout: 5s
       retries: 5
 
-  # --- 2. Приложение PII Guard ---
   app:
     build: .
     container_name: pii_guard_app
     depends_on:
       db:
-        condition: service_healthy # Ждем, пока БД полностью поднимется
+        condition: service_healthy
     environment:
-      # Передаем настройки подключения внутрь контейнера
       POSTGRES_DB: testdb
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: secret_password
-      DB_HOST: db # Имя сервиса выше
+      # На стенде приложение по-прежнему стартует под admin, чтобы
+      # init_db_logic.sql мог CREATE EXTENSION / CREATE ROLE. В проде нужно:
+      #   1) применить init_db_logic.sql разово от суперюзера,
+      #   2) выставить здесь POSTGRES_USER=pii_guard_app + PG_APP_PASSWORD,
+      #   3) приложение начнёт работать с минимальными правами и больше не
+      #      сможет отключить триггер защиты audit_log (DISABLE TRIGGER).
+      POSTGRES_USER: ${DB_APP_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret_password}
+      DB_HOST: db
       DB_PORT: 5432
+      # SECRET_KEY обязательно задавать через .env в любой не-локальной среде;
+      # fallback здесь — только чтобы docker compose up на чистом стенде не падал.
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production-plz}
     ports:
-      - "8501:8501" # Интерфейс Streamlit
-    volumes:
-      # Монтируем текущую папку, чтобы код можно было править на лету (опционально)
-      - .:/app
-    command: >
-      sh -c "python seed_data_relational.py && streamlit run app.py --server.port=8501 --server.address=0.0.0.0"
+      - "5000:5000"
+    # Bind mount убран: он шадовал образ (включая симлинк на DejaVuSans.ttf,
+    # созданный в Dockerfile) и ломал PDF-отчёт на Windows-хосте. Для hot-reload
+    # в разработке смонтируйте только templates/static/, а не весь проект.
 
 volumes:
   pg_data:

@@ -1,13 +1,16 @@
 import psycopg2
-from psycopg2 import sql, pool # <--- Добавлено для защиты от SQL Injection
+from psycopg2 import sql, pool
 import re
 import os
 import datetime
 import subprocess
 import sqlite3
-import streamlit as st
+import tempfile
+import threading
 from faker import Faker
 from fpdf import FPDF
+from werkzeug.security import generate_password_hash, check_password_hash
+import validators as _validators
 
 # Инициализируем генератор (ru_RU - чтобы создавал российские данные)
 fake = Faker('ru_RU')
@@ -35,65 +38,69 @@ SKIP_COLUMN_KEYWORDS = [
 ]
 
 # 2. ПАТТЕРНЫ ПОИСКА (RegEx) - Extended Version
+#
+# Важно про порядок: scan_database делает break при ПЕРВОМ матче, поэтому
+# регексы упорядочены от самых длинных/специфичных к коротким. Если поставить
+# INN10 перед OGRN13, то OGRN '1234567890123' уйдёт в INN10 как первое
+# попавшееся, и тип определится случайно. \b на цифровых паттернах тоже
+# обманчив (буква перед цифрой считается word-boundary), поэтому везде, где
+# матчим только цифры, используем (?<!\d)…(?!\d) — иначе один и тот же
+# 16-значный номер ОМС подсветится и как Passport (4+6), и как INN12.
 PII_PATTERNS = {
     # --- Базовые контакты ---
     "Email": r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b",
-    "Phone (RU)": r"(?:\+7|8|7)[\s\(-]*\d{3}[\s\)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}",
-    
-    # --- Личные документы РФ ---
-    "Passport (RU Internal)": r"\b\d{4}[\s-]?\d{6}\b",         # Паспорт РФ (серия номер)
-    "Passport (RU International)": r"\b\d{2}[\s]?\d{7}\b",      # Загранпаспорт (старый и новый)
-    "SNILS": r"\b\d{3}[ -]?\d{3}[ -]?\d{3}[ -]?\d{2}\b",        # СНИЛС
-    "Driver License (RU)": r"\b\d{2}[\s]?[A-ZА-Я0-9]{2}[\s]?\d{6}\b", # Водительское удостоверение
-    "Birth Certificate (RU)": r"[IVX]{1,3}[\-][А-Я]{2}\s\d{6}", # Свид. о рождении (I-МЯ 123456)
-    "OMS (Medical Policy)": r"\b\d{16}\b",                      # Полис ОМС (16 цифр)
-    
-    # --- Бизнес и Налоги (РФ) ---
-    "INN (Individual 12)": r"\b\d{12}\b",                       # ИНН Физлица
-    "INN (Company 10)": r"\b\d{10}\b",                          # ИНН Юрлица
-    "OGRN (Company)": r"\b\d{13}\b",                            # ОГРН
-    "OGRNIP (Entrepreneur)": r"\b\d{15}\b",                     # ОГРНИП
-    "KPP (Tax Reason Code)": r"\b\d{9}\b",                      # КПП
-    
-    # --- Финансы ---
-    "Credit Card": r"\b(?:\d{4}[ -]?){3,4}\d{1,4}\b",           # Банковская карта
-    "IBAN (Int. Bank Account)": r"\b[A-Z]{2}\d{2}[A-Z0-9]{4,30}\b", # IBAN счет
-    "Bitcoin Wallet": r"\b(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,39}\b", # Криптокошелек BTC
-    "Ethereum Wallet": r"\b0x[a-fA-F0-9]{40}\b",                # Криптокошелек ETH
-    
+    # Раньше регекс ловил ведущую '7' внутри любого 11-значного числа (ИНН/ОГРН).
+    # (?<!\d) гарантирует, что перед +7/8/7 нет другой цифры; (?!\d) — что после
+    # хвоста тоже нет цифры (иначе кусок длинного номера тоже считался телефоном).
+    "Phone (RU)": r"(?<!\d)(?:\+7|8|7)[\s\(-]*\d{3}[\s\)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}(?!\d)",
+
+    # --- Самые длинные числовые ID идут ПЕРВЫМИ, чтобы их не перехватил
+    # более короткий регекс на префикс. ---
+    "OMS (Medical Policy)":  r"(?<!\d)\d{16}(?!\d)",      # 16 цифр — полис ОМС
+    "OGRNIP (Entrepreneur)": r"(?<!\d)\d{15}(?!\d)",      # 15 цифр — ОГРНИП
+    "OGRN (Company)":        r"(?<!\d)\d{13}(?!\d)",      # 13 цифр — ОГРН
+    "Credit Card":           r"(?<!\d)(?:\d{4}[ -]?){3,4}\d{1,4}(?!\d)",  # 13-19 цифр с разделителями
+    "INN (Individual 12)":   r"(?<!\d)\d{12}(?!\d)",      # 12 цифр — ИНН физлица
+    "SNILS":                 r"(?<!\d)\d{3}[ -]?\d{3}[ -]?\d{3}[ -]?\d{2}(?!\d)",  # 11 цифр
+    "Passport (RU Internal)":     r"(?<!\d)\d{4}[\s-]?\d{6}(?!\d)",   # 10 цифр
+    "INN (Company 10)":           r"(?<!\d)\d{10}(?!\d)",             # 10 цифр
+    "Passport (RU International)": r"(?<!\d)\d{2}[\s]?\d{7}(?!\d)",   # 9 цифр
+    "KPP (Tax Reason Code)":      r"(?<!\d)\d{9}(?!\d)",              # 9 цифр
+
+    # --- Документы со смешанным алфавитом — порядок не критичен ---
+    "Driver License (RU)":   r"\b\d{2}[\s]?[A-ZА-Я0-9]{2}[\s]?\d{6}\b",
+    "Birth Certificate (RU)": r"[IVX]{1,3}[\-][А-Я]{2}\s\d{6}",
+
+    # --- Финансы (нечисловые) ---
+    "IBAN (Int. Bank Account)": r"\b[A-Z]{2}\d{2}[A-Z0-9]{4,30}\b",
+    "Bitcoin Wallet": r"\b(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,39}\b",
+    "Ethereum Wallet": r"\b0x[a-fA-F0-9]{40}\b",
+
     # --- IT и Безопасность ---
-    "IPv4 Address": r"\b(?:\d{1,3}\.){3}\d{1,3}\b",             # IP адрес
-    "MAC Address": r"\b([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})\b", # MAC адрес устройства
-    "JWT Token": r"eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+", # Токены авторизации
-    "AWS API Key": r"AKIA[0-9A-Z]{16}",                         # Ключи AWS (утечки облака)
-    "Private Key (Header)": r"-----BEGIN (?:RSA|DSA|EC|OPENSSH) PRIVATE KEY-----", # Приватные ключи
-    "UUID / GUID": r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", # Технические ID
+    "IPv4 Address": r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+    "MAC Address": r"\b([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})\b",
+    "JWT Token": r"eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+",
+    "AWS API Key": r"AKIA[0-9A-Z]{16}",
+    "Private Key (Header)": r"-----BEGIN (?:RSA|DSA|EC|OPENSSH) PRIVATE KEY-----",
+    "UUID / GUID": r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
 
     # --- Соцсети и Гео ---
     "Social: Telegram": r"(?:t\.me\/|@)[a-zA-Z0-9_]{5,}",
     "Social: VK": r"(?:vk\.com\/)[a-zA-Z0-9_.]+",
-    "Geo Coordinates": r"\b-?\d{1,3}\.\d+,\s*-?\d{1,3}\.\d+\b", # Координаты (широта, долгота)
+    "Geo Coordinates": r"\b-?\d{1,3}\.\d+,\s*-?\d{1,3}\.\d+\b",
 
     # --- Секреты и Пароли ---
-    # BCrypt Hash (стандарт для паролей): Начинается на $2a$, $2b$, $2y$ и длинный хвост
     "Password Hash (BCrypt)": r"^\$2[ayb]\$.{56}$",
-    
-    # MD5 Hash (старый формат паролей): 32 символа hex
-    "Password Hash (MD5)": r"\b[a-fA-F0-9]{32}\b",
-    
-    # SHA-256 Hash: 64 символа hex
-    "Password Hash (SHA256)": r"\b[a-fA-F0-9]{64}\b",
-    
-    # Generic API Key / Secret: требуем смесь верхнего/нижнего регистра + цифру, мин. 32 символа
-    # Это снижает ложные срабатывания на обычных словах и UUID-подобных значениях
+    "Password Hash (SHA256)": r"\b[a-fA-F0-9]{64}\b",  # 64 hex
+    "Password Hash (MD5)":    r"\b[a-fA-F0-9]{32}\b",  # 32 hex — после SHA256, иначе SHA-фрагменты ловит MD5
     "Generic API Key / Secret": r"\b(?=[a-zA-Z0-9]*[A-Z])(?=[a-zA-Z0-9]*[a-z])(?=[a-zA-Z0-9]*[0-9])[a-zA-Z0-9]{32,60}\b",
-    
+
     # --- Сложные проверки (Контекстные) ---
     "FIO (RU)": r"\b[А-ЯЁ][а-яё]{1,20}\s+[А-ЯЁ][а-яё]{1,20}\s+[А-ЯЁ][а-яё]{1,20}\b",
     "Date of Birth": r"\b(?:0[1-9]|[12][0-9]|3[01])[\.\/-](?:0[1-9]|1[012])[\.\/-](?:19|20)\d{2}\b",
-    
+
     # --- Универсальный (для ручной разметки) ---
-    "Generic / Any Content": r".+" 
+    "Generic / Any Content": r".+"
 }
 
 # 3. ПОДОЗРИТЕЛЬНЫЕ НАЗВАНИЯ (Для Metadata Profiling)
@@ -113,50 +120,51 @@ SUSPICIOUS_NAMES = {
 
 # --- УПРАВЛЕНИЕ ПУЛОМ СОЕДИНЕНИЙ ---
 
-@st.cache_resource(show_spinner=False)
-def get_db_pool(db_config):
-    """
-    Создает пул соединений. 
-    Кешируется Streamlit: если конфиг не менялся, вернет уже готовый пул.
-    """
-    try:
-        # ThreadedConnectionPool подходит для Streamlit (многопоточный)
-        # minconn=1, maxconn=20
-        return pool.ThreadedConnectionPool(1, 20, **db_config)
-    except Exception as e:
-        print(f"Pool Creation Error: {e}")
-        return None
+_pool_cache: dict = {}
+_pool_lock = threading.Lock()
+
+def _pool_key(db_config: dict) -> tuple:
+    return (db_config.get('host'), db_config.get('port'),
+            db_config.get('dbname'), db_config.get('user'))
+
+def get_db_pool(db_config: dict):
+    """Возвращает пул соединений из кэша или создаёт новый."""
+    key = _pool_key(db_config)
+    with _pool_lock:
+        if key not in _pool_cache:
+            try:
+                _pool_cache[key] = pool.ThreadedConnectionPool(1, 20, **db_config)
+            except Exception as e:
+                print(f"Pool Creation Error: {e}")
+                return None
+        return _pool_cache[key]
 
 def get_connection(db_config=None):
-    """Получает соединение из пула с механизмом самоисцеления"""
+    """Получает соединение из пула с механизмом самоисцеления."""
     target_conf = db_config if db_config else DB_CONFIG
-    
     try:
-        # 1. Получаем объект пула
         db_pool = get_db_pool(target_conf)
         if not db_pool:
             return "Error creating connection pool"
-            
-        # 2. Пытаемся взять соединение (nowait=False ждет, но мы ловим переполнение)
         conn = db_pool.getconn()
         return conn
-        
     except pool.PoolError:
-        # 3. ПОЙМАЛИ ОШИБКУ "Pool exhausted"!
-        print("⚠️ Pool exhausted! Performing self-healing (clearing cache)...")
-        
-        # Сбрасываем кэш ресурсов Streamlit (уничтожаем старый пул)
-        st.cache_resource.clear()
-        
-        # Создаем новый пул с нуля
+        print("⚠️ Pool exhausted! Performing self-healing...")
+        key = _pool_key(target_conf)
+        with _pool_lock:
+            if key in _pool_cache:
+                try:
+                    _pool_cache[key].closeall()
+                except Exception:
+                    pass
+                del _pool_cache[key]
         db_pool = get_db_pool(target_conf)
-        
-        # Пробуем взять соединение снова
-        try:
-            return db_pool.getconn()
-        except Exception as e:
-            return f"Critical Pool Error after reset: {e}"
-            
+        if db_pool:
+            try:
+                return db_pool.getconn()
+            except Exception as e:
+                return f"Critical Pool Error after reset: {e}"
+        return "Error creating connection pool after reset"
     except Exception as e:
         return str(e)
 
@@ -171,6 +179,16 @@ def close_connection(conn, db_config=None):
             db_pool.putconn(conn)
     except Exception as e:
         print(f"Error returning connection to pool: {e}")
+
+def _pg_sec_event(conn, event: str, details: str = None):
+    """Записывает событие безопасности приложения в pii_guard.audit_log."""
+    try:
+        cur = conn.cursor()
+        cur.execute("CALL pii_guard.log_security_event(%s, %s)", (event, details))
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        print(f"Security event log error ({event}): {e}")
 
 def get_all_tables(db_config=None):
     """Получает список всех таблиц в схеме public"""
@@ -260,6 +278,10 @@ def save_batch_settings(updates, db_config=None):
 
         data = [(x['table'], x['col'], x['status'], x['type']) for x in valid_updates]
         cur.executemany(query, data)
+        cur.execute("CALL pii_guard.log_security_event(%s, %s)", (
+            'GOVERNANCE_UPDATE',
+            f'Обновлено {len(valid_updates)} правил разметки колонок'
+        ))
         conn.commit()
         return True
     except Exception as e:
@@ -363,8 +385,10 @@ def scan_database(excluded_tables=None, active_patterns=None, db_config=None, li
                 target_patterns = {forced_type: PII_PATTERNS[forced_type]}
         
         # --- ШАГ 3: ЧТЕНИЕ ДАННЫХ ---
+        # Используем ctid вместо id — таблица может вообще не иметь колонки id
+        # (составной PK, user_id и т.п.). ctid однозначно идентифицирует физическую строку.
         try:
-            query = sql.SQL("SELECT id::text, {}::text FROM {} WHERE {} IS NOT NULL LIMIT {}").format(
+            query = sql.SQL("SELECT ctid::text, {}::text FROM {} WHERE {} IS NOT NULL LIMIT {}").format(
                 sql.Identifier(col),
                 sql.Identifier(table),
                 sql.Identifier(col),
@@ -374,29 +398,37 @@ def scan_database(excluded_tables=None, active_patterns=None, db_config=None, li
             rows = cur.fetchall()
         except Exception as e:
             print(f"⚠️ Ошибка чтения {table}.{col}: {e}")
+            conn.rollback()  # иначе соединение останется в aborted tx
             continue
 
         # --- ШАГ 4: АНАЛИЗ КОНТЕНТА ---
         for row_id, val in rows:
             text_val = str(val)
-            
-            for p_name, p_regex in target_patterns.items():
-                if re.search(p_regex, text_val):
-                    
-                    # Контекстная проверка для Дат
-                    if p_name == "Date of Birth":
-                        if not check_date_context(text_val):
-                            continue 
-                            
-                    findings.append({
-                        "table": table,
-                        "column": col,
-                        "id": row_id,
-                        "type": p_name,
-                        "value": text_val
-                    })
-                    break # Нашли угрозу -> следующая строка
 
+            for p_name, p_regex in target_patterns.items():
+                m = re.search(p_regex, text_val)
+                if not m:
+                    continue
+
+                # Контекстная проверка для Дат — раньше check_date_context
+                # парсил всё поле и брал первый год, поэтому "created 2025, born
+                # 1980" проверялся по 2025. Теперь смотрим строго на матч.
+                if p_name == "Date of Birth":
+                    if not check_date_context(m.group(0)):
+                        continue
+
+                findings.append({
+                    "table":     table,
+                    "column":    col,
+                    "id":        row_id,
+                    "type":      p_name,
+                    "value":     text_val,
+                    "validated": _validators.validate(p_name, text_val),
+                })
+                break # Нашли угрозу -> следующая строка
+
+    _pg_sec_event(conn, 'SCAN',
+        f'Сканирование завершено: {len(findings)} находок в {total_cols} колонках')
     cur.close()
     close_connection(conn, db_config)
     return findings
@@ -442,7 +474,11 @@ def init_db_security(db_config=None):
     if isinstance(conn, str): return
     cur = conn.cursor()
     try:
-        with open("init_db_logic.sql", "r", encoding="utf-8") as f:
+        # Абсолютный путь — иначе при смене CWD (тесты, IDE, gunicorn) open()
+        # ловил FileNotFoundError, и init молча падал.
+        sql_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "init_db_logic.sql")
+        with open(sql_path, "r", encoding="utf-8") as f:
             cur.execute(f.read())
         
         # Включаем аудит для всех таблиц
@@ -500,16 +536,27 @@ def mask_data(findings, mode='mask', db_config=None):
                 else: new_value = fake.word()
 
                 try:
-                    # Используем sql.Identifier для защиты имен таблиц/колонок
-                    query = sql.SQL("UPDATE {} SET {} = %s WHERE id = %s").format(
+                    # row_id здесь — это ctid из scan_database (тип tid).
+                    # Каст явный, чтобы apk был валиден для любой таблицы независимо от наличия id.
+                    query = sql.SQL("UPDATE {} SET {} = %s WHERE ctid = %s::tid").format(
                         sql.Identifier(table),
                         sql.Identifier(col)
                     )
                     cur.execute(query, (new_value, row_id))
                     count += 1
                 except Exception as e:
-                    print(f"⚠️ Ошибка маскирования {table}.{col} id={row_id}: {e}")
+                    print(f"⚠️ Ошибка маскирования {table}.{col} ctid={row_id}: {e}")
+                    conn.rollback()
                     
+        # Раньше MASS_MASKING-событие писалось только внутри fast_mask на каждую
+        # колонку, а сводное событие — только в fake-ветке. Из-за этого счётчик
+        # MASS_MASKING на дашборде безопасности всегда равнялся 0.
+        if mode == 'fake':
+            _pg_sec_event(conn, 'MASS_FAKER',
+                f'Синтетическая замена {count} записей (Faker)')
+        else:
+            _pg_sec_event(conn, 'MASS_MASKING',
+                f'SQL-маскирование {count} записей в {len(unique_tasks)} колонках')
         conn.commit()
         db_name_log = db_config['dbname'] if db_config else "unknown_db"
         log_event("MASK", db_name_log, f"Обезличено {count} записей ({mode})")
@@ -537,7 +584,13 @@ def generate_sanitized_dump(findings, mode='mask', db_config=None):
 
     original_db = _validate_identifier(target_conf['dbname'])
     temp_db = _validate_identifier(f"{original_db}_anon_temp")
-    dump_file = "/tmp/sanitized_dump.sql"
+    # Хардкод /tmp ломал работу на Windows и при параллельных дампах двух админов.
+    # NamedTemporaryFile с delete=False даёт уникальный путь и в Linux, и в Windows.
+    _dump_handle = tempfile.NamedTemporaryFile(
+        mode='w', suffix='.sql', prefix=f'pii_dump_{original_db}_', delete=False
+    )
+    dump_file = _dump_handle.name
+    _dump_handle.close()
     
     # Коннект к системной базе postgres для клонирования
     admin_config = target_conf.copy()
@@ -564,6 +617,18 @@ def generate_sanitized_dump(findings, mode='mask', db_config=None):
                   AND pid <> pg_backend_pid()
             """).format(sql.Literal(original_db))
         )
+
+        # 1a. Все соединения в нашем пуле к этой БД теперь мертвы (мы их сами и убили).
+        # Пул о факте ничего не знает — следующий get_connection() вернёт мёртвый коннект
+        # и упадёт с OperationalError. Сбрасываем пул, чтобы он пересоздался лениво.
+        orig_key = _pool_key(target_conf)
+        with _pool_lock:
+            dead_pool = _pool_cache.pop(orig_key, None)
+            if dead_pool is not None:
+                try:
+                    dead_pool.closeall()
+                except Exception:
+                    pass
 
         # 2. Клонируем БД (DDL не поддерживает параметры — используем sql.Identifier после валидации)
         cur.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(temp_db)))
@@ -602,7 +667,15 @@ def generate_sanitized_dump(findings, mode='mask', db_config=None):
         
         subprocess.run(cmd, env=env, check=True)
         print(f"💾 Дамп готов: {dump_file}")
-        
+
+        try:
+            log_conn = psycopg2.connect(**target_conf)
+            _pg_sec_event(log_conn,
+                'DUMP', f'Безопасный дамп {original_db} создан ({dump_file})')
+            log_conn.close()
+        except Exception as e:
+            print(f"Dump security event error: {e}")
+
         return dump_file
 
     except Exception as e:
@@ -830,3 +903,309 @@ def get_audit_logs():
     rows = cur.fetchall()
     conn.close()
     return rows
+
+
+# ── АУТЕНТИФИКАЦИЯ И RBAC (Этап 2) ──────────────────────────
+
+def init_auth_db(db_config=None):
+    """Создаёт pii_guard.users и дефолтного admin (если таблица пустая)."""
+    conn = get_connection(db_config)
+    if isinstance(conn, str):
+        print(f"Auth DB init error: {conn}")
+        return
+    cur = conn.cursor()
+    try:
+        cur.execute("CREATE SCHEMA IF NOT EXISTS pii_guard;")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pii_guard.users (
+                user_id    SERIAL PRIMARY KEY,
+                username   TEXT UNIQUE NOT NULL,
+                pass_hash  TEXT NOT NULL,
+                role       TEXT NOT NULL DEFAULT 'viewer'
+                               CHECK (role IN ('admin', 'analyst', 'viewer')),
+                created_at TIMESTAMPTZ DEFAULT now(),
+                is_active  BOOLEAN DEFAULT TRUE
+            )
+        """)
+        cur.execute("SELECT COUNT(*) FROM pii_guard.users")
+        if cur.fetchone()[0] == 0:
+            cur.execute(
+                "INSERT INTO pii_guard.users (username, pass_hash, role) VALUES (%s, %s, 'admin')",
+                ('admin', generate_password_hash('admin123'))
+            )
+            print("✅ Создан дефолтный пользователь: admin / admin123")
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"Auth DB init error: {e}")
+    finally:
+        cur.close()
+        close_connection(conn, db_config)
+
+
+class AuthBackendError(Exception):
+    """Поднимается, когда verify_user не смог дойти до БД — отличается от
+    неверного пароля. Чтобы аудит не забивался ложными LOGIN_FAILED, когда на
+    самом деле БД легла."""
+
+
+def verify_user(username: str, password: str, db_config=None):
+    """Проверяет логин/пароль.
+    Возвращает (user_id, role) при успехе; None — если такой пары нет.
+    Бросает AuthBackendError, если до БД не удалось дойти."""
+    conn = get_connection(db_config)
+    if isinstance(conn, str):
+        raise AuthBackendError(conn)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT user_id, pass_hash, role FROM pii_guard.users "
+            "WHERE username = %s AND is_active = TRUE",
+            (username,)
+        )
+        row = cur.fetchone()
+        if row and check_password_hash(row[1], password):
+            return (row[0], row[2])
+        return None
+    except Exception as e:
+        # Чтобы соединение не вернулось в пул с aborted-tx.
+        try: conn.rollback()
+        except Exception: pass
+        print(f"verify_user error: {e}")
+        raise AuthBackendError(str(e))
+    finally:
+        cur.close()
+        close_connection(conn, db_config)
+
+
+def create_user(username: str, password: str, role: str = 'viewer', db_config=None) -> bool:
+    """Создаёт нового пользователя. Возвращает True при успехе."""
+    if role not in ('admin', 'analyst', 'viewer'):
+        return False
+    conn = get_connection(db_config)
+    if isinstance(conn, str):
+        return False
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO pii_guard.users (username, pass_hash, role) VALUES (%s, %s, %s)",
+            (username, generate_password_hash(password), role)
+        )
+        _pg_sec_event(conn, 'USER_CREATED',
+                      f'Создан пользователь {username} с ролью {role}')
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        print(f"create_user error: {e}")
+        return False
+    finally:
+        cur.close()
+        close_connection(conn, db_config)
+
+
+def list_users(db_config=None):
+    """Возвращает список пользователей (без хэшей)."""
+    conn = get_connection(db_config)
+    if isinstance(conn, str):
+        return []
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT user_id, username, role, created_at, is_active "
+            "FROM pii_guard.users ORDER BY user_id"
+        )
+        return cur.fetchall()
+    except Exception as e:
+        print(f"list_users error: {e}")
+        return []
+    finally:
+        cur.close()
+        close_connection(conn, db_config)
+
+
+def delete_user(user_id: int, db_config=None) -> bool:
+    """Мягкое удаление пользователя (is_active = FALSE).
+    Возвращает False, если это последний активный admin — иначе система
+    осталась бы без управления."""
+    conn = get_connection(db_config)
+    if isinstance(conn, str):
+        return False
+    cur = conn.cursor()
+    try:
+        # Проверяем: пытаемся ли мы выключить последнего активного admin.
+        # SELECT ... FOR UPDATE удерживает строку до commit, чтобы два
+        # одновременных DELETE двух разных админов не обошли проверку.
+        cur.execute(
+            "SELECT role FROM pii_guard.users "
+            "WHERE user_id = %s AND is_active = TRUE FOR UPDATE",
+            (user_id,)
+        )
+        target = cur.fetchone()
+        if not target:
+            conn.rollback()
+            return False
+        if target[0] == 'admin':
+            cur.execute(
+                "SELECT COUNT(*) FROM pii_guard.users "
+                "WHERE role = 'admin' AND is_active = TRUE"
+            )
+            (active_admins,) = cur.fetchone()
+            if active_admins <= 1:
+                conn.rollback()
+                print("delete_user: refused — last active admin")
+                return False
+
+        cur.execute(
+            "UPDATE pii_guard.users SET is_active = FALSE "
+            "WHERE user_id = %s RETURNING username",
+            (user_id,)
+        )
+        row = cur.fetchone()
+        if row:
+            _pg_sec_event(conn, 'USER_DELETED',
+                          f'Деактивирован пользователь {row[0]}')
+        conn.commit()
+        return bool(row)
+    except Exception as e:
+        conn.rollback()
+        print(f"delete_user error: {e}")
+        return False
+    finally:
+        cur.close()
+        close_connection(conn, db_config)
+
+
+def get_security_stats(db_config=None) -> dict:
+    """Агрегаты по событиям безопасности за последние 24 часа."""
+    conn = get_connection(db_config)
+    if isinstance(conn, str):
+        return {}
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT
+                COUNT(*)                                                      AS total,
+                COUNT(*) FILTER (WHERE operation = 'LOGIN_FAILED')            AS login_failed,
+                COUNT(*) FILTER (WHERE operation IN ('MASS_MASKING','MASS_FAKER')) AS masking,
+                COUNT(*) FILTER (WHERE operation = 'SCAN')                    AS scans
+            FROM pii_guard.audit_log
+            WHERE event_class = 'SECURITY'
+              AND event_time >= now() - INTERVAL '24 hours'
+        """)
+        row = cur.fetchone()
+        if not row:
+            return {'total': 0, 'login_failed': 0, 'masking': 0, 'scans': 0}
+        return {
+            'total':        row[0],
+            'login_failed': row[1],
+            'masking':      row[2],
+            'scans':        row[3],
+        }
+    except Exception as e:
+        print(f"get_security_stats error: {e}")
+        return {}
+    finally:
+        cur.close()
+        close_connection(conn, db_config)
+
+
+def _parse_date_filter(raw):
+    """Принимает строку из UI (YYYY-MM-DD или ISO timestamp) и возвращает
+    datetime либо None. На мусоре — None, чтобы не пробрасывать его в SQL и
+    не получать aborted-tx."""
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    if not raw:
+        return None
+    # Поддерживаем YYYY-MM-DD и полный ISO. fromisoformat в py3.10 не любит 'Z',
+    # обрезаем при необходимости.
+    try:
+        return datetime.datetime.fromisoformat(raw.replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        return None
+
+
+def get_security_events(operation=None, db_user=None,
+                        date_from=None, date_to=None,
+                        limit=50, offset=0, db_config=None) -> list:
+    """
+    События безопасности из pii_guard.audit_log (event_class = 'SECURITY').
+    Поддерживает фильтрацию по операции, пользователю и диапазону дат.
+    """
+    conn = get_connection(db_config)
+    if isinstance(conn, str):
+        return []
+    cur = conn.cursor()
+    try:
+        conditions = ["event_class = 'SECURITY'"]
+        params = []
+        if operation:
+            conditions.append("operation = %s")
+            params.append(operation)
+        if db_user:
+            conditions.append("(db_user ILIKE %s OR app_user ILIKE %s)")
+            params.extend([f'%{db_user}%', f'%{db_user}%'])
+        # Битые даты раньше прокидывались в PG, ронялись и оставляли соединение
+        # в aborted-tx; теперь невалидные значения просто игнорируются.
+        df = _parse_date_filter(date_from)
+        if df is not None:
+            conditions.append("event_time >= %s")
+            params.append(df)
+        dt = _parse_date_filter(date_to)
+        if dt is not None:
+            conditions.append("event_time <= %s")
+            params.append(dt)
+
+        where = " AND ".join(conditions)
+        params.extend([limit, offset])
+        cur.execute(f"""
+            SELECT event_id, event_time, db_user, app_user, client_ip,
+                   operation, details, row_hash
+            FROM pii_guard.audit_log
+            WHERE {where}
+            ORDER BY event_time DESC
+            LIMIT %s OFFSET %s
+        """, params)
+        return cur.fetchall()
+    except Exception as e:
+        # Обязательно rollback, иначе следующий пользователь пула получит
+        # aborted-tx и весь дашборд встанет.
+        try: conn.rollback()
+        except Exception: pass
+        print(f"get_security_events error: {e}")
+        return []
+    finally:
+        cur.close()
+        close_connection(conn, db_config)
+
+
+def verify_audit_chain(db_config=None) -> dict:
+    """Запускает verify_audit_chain() в БД. Возвращает словарь с результатом."""
+    conn = get_connection(db_config)
+    if isinstance(conn, str):
+        return {'ok': False, 'message': f'Нет соединения: {conn}'}
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT ok, broken_event_id, message FROM pii_guard.verify_audit_chain()")
+        row = cur.fetchone()
+        if row:
+            return {'ok': row[0], 'broken_event_id': row[1], 'message': row[2]}
+        return {'ok': False, 'message': 'Функция не вернула результат'}
+    except Exception as e:
+        return {'ok': False, 'message': str(e)}
+    finally:
+        cur.close()
+        close_connection(conn, db_config)
+
+
+def log_auth_event(event: str, details: str = None, db_config=None):
+    """Пишет событие аутентификации в pii_guard.audit_log (ENV-база)."""
+    conn = get_connection(db_config)
+    if isinstance(conn, str):
+        return
+    try:
+        _pg_sec_event(conn, event, details)
+    finally:
+        close_connection(conn, db_config)

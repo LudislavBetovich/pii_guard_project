@@ -1,0 +1,300 @@
+{% extends "base.html" %}
+{% block title %}Результаты{% endblock %}
+
+{% block content %}
+{% if total == 0 %}
+<div class="alert alert-success fs-5 text-center mt-4">
+  <i class="bi bi-check-circle-fill"></i> Угроз не найдено! База данных чиста.
+</div>
+<a href="/scan" class="btn btn-outline-primary">← Назад к сканеру</a>
+
+{% else %}
+
+<!-- Метрики -->
+<div class="row g-3 mb-3">
+  <div class="col-6 col-md-3">
+    <div class="card text-center shadow-sm border-danger">
+      <div class="card-body py-3">
+        <div class="fs-2 fw-bold text-danger">{{ total }}</div>
+        <div class="text-muted small">Всего находок</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card text-center shadow-sm">
+      <div class="card-body py-3">
+        <div class="fs-2 fw-bold text-warning">{{ type_counts|length }}</div>
+        <div class="text-muted small">Типов угроз</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card text-center shadow-sm">
+      <div class="card-body py-3">
+        <div class="fs-2 fw-bold text-primary">{{ table_counts|length }}</div>
+        <div class="text-muted small">Таблиц затронуто</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card text-center shadow-sm border-success">
+      <div class="card-body py-3">
+        <div class="fs-2 fw-bold text-success">{{ validated_count }}</div>
+        <div class="text-muted small">
+          <i class="bi bi-check-circle-fill text-success me-1"></i>Подтверждено алгоритмом
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3 mb-3">
+  <!-- График -->
+  <div class="col-lg-5">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-dark text-white small"><i class="bi bi-bar-chart-fill"></i> По типам угроз</div>
+      <div class="card-body"><canvas id="typeChart" height="200"></canvas></div>
+    </div>
+  </div>
+  <!-- Сводная таблица -->
+  <div class="col-lg-7">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-dark text-white small"><i class="bi bi-table"></i> Сводка (таблица / колонка / тип)</div>
+      <div class="card-body p-0">
+        <div class="table-responsive" style="max-height:280px;overflow-y:auto">
+          <table class="table table-sm table-hover mb-0">
+            <thead class="table-light sticky-top"><tr>
+              <th>Таблица</th><th>Колонка</th><th>Тип</th><th class="text-end">Кол-во</th>
+            </tr></thead>
+            <tbody>
+              {% for r in summary %}
+              <tr>
+                <td><code>{{ r.table }}</code></td>
+                <td><code>{{ r.column }}</code></td>
+                <td><span class="badge bg-warning text-dark">{{ r.type }}</span></td>
+                <td class="text-end fw-bold">{{ r.count }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Детальный список -->
+<div class="card shadow-sm mb-3">
+  <div class="card-header bg-dark text-white small d-flex justify-content-between">
+    <span><i class="bi bi-list-ul"></i> Детальный список (до 500 строк)</span>
+    <button class="btn btn-sm btn-outline-light" type="button"
+            data-bs-toggle="collapse" data-bs-target="#rawTable">Показать / скрыть</button>
+  </div>
+  <div class="collapse" id="rawTable">
+    <div class="table-responsive" style="max-height:320px;overflow-y:auto">
+      <table class="table table-sm table-striped mb-0">
+        <thead class="table-dark sticky-top"><tr>
+          <th>ID</th><th>Тип</th><th>Статус</th><th>Таблица</th><th>Колонка</th><th>Значение</th>
+        </tr></thead>
+        <tbody>
+          {% for f in findings %}
+          <tr>
+            <td>{{ f.id }}</td>
+            <td><span class="badge bg-warning text-dark">{{ f.type }}</span></td>
+            <td>
+              {# Jinja-тест "is true" сравнивает с Python True по тождеству; backend
+                 может вернуть 1/0/None — поэтому проверяем явно через равенство. #}
+              {% if f.validated == True %}
+                <span class="badge bg-success" title="Прошло алгоритмическую проверку">
+                  <i class="bi bi-check-circle-fill me-1"></i>Алгоритм
+                </span>
+              {% elif f.validated == False %}
+                <span class="badge bg-warning text-dark" title="Найдено по RegEx, не прошло контрольную сумму">
+                  <i class="bi bi-exclamation-triangle-fill me-1"></i>Только RegEx
+                </span>
+              {% else %}
+                <span class="text-muted small">—</span>
+              {% endif %}
+            </td>
+            <td><code>{{ f.table }}</code></td>
+            <td><code>{{ f.column }}</code></td>
+            <td><span class="text-danger font-monospace">{{ f.value[:60] }}</span></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Действия -->
+<div class="row g-3 mb-3">
+  <!-- PDF -->
+  <div class="col-md-3">
+    <div class="card shadow-sm">
+      <div class="card-body text-center">
+        <i class="bi bi-file-earmark-pdf fs-2 text-danger"></i>
+        <div class="mt-2">
+          <a href="/results/pdf" class="btn btn-outline-danger w-100">
+            <i class="bi bi-download"></i> Скачать PDF-отчёт
+          </a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Danger Zone — только для admin (бэк защищает role_required, но UI тоже скрываем) -->
+  {% if session.user_role == 'admin' %}
+  <div class="col-md-9">
+    <div class="card shadow-sm border-danger">
+      <div class="card-header bg-danger text-white small fw-bold">
+        <i class="bi bi-exclamation-triangle-fill"></i> Зона обезличивания (Danger Zone)
+      </div>
+      <div class="card-body">
+        <div class="row g-2 align-items-center">
+          <div class="col-md-4">
+            <label class="form-label small fw-semibold">Метод защиты</label>
+            <select class="form-select form-select-sm" id="maskMode">
+              <option value="mask">Маскирование (****)</option>
+              <option value="fake">Синтетические данные (Faker)</option>
+            </select>
+          </div>
+          <div class="col-md-4">
+            <div class="form-check mt-3">
+              <input class="form-check-input" type="checkbox" id="confirmMask">
+              <label class="form-check-label small text-danger fw-semibold" for="confirmMask">
+                Я понимаю, что изменения необратимы
+              </label>
+            </div>
+          </div>
+          <div class="col-md-2">
+            <button class="btn btn-danger w-100 mt-2" id="btnMask" disabled>
+              <i class="bi bi-eraser-fill"></i> Обезличить
+            </button>
+          </div>
+          <div class="col-md-2">
+            <button class="btn btn-outline-danger w-100 mt-2" id="btnDump">
+              <i class="bi bi-box-arrow-down"></i> Дамп (безопасный)
+            </button>
+          </div>
+        </div>
+        <div id="maskResult" class="mt-2"></div>
+      </div>
+    </div>
+  </div>
+  {% else %}
+  <div class="col-md-9">
+    <div class="alert alert-secondary mb-0 d-flex align-items-center">
+      <i class="bi bi-info-circle me-2"></i>
+      Маскирование и безопасный дамп доступны только администратору.
+    </div>
+  </div>
+  {% endif %}
+</div>
+
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+{% if total > 0 %}
+// График
+const labels = {{ type_counts.keys() | list | tojson }};
+const values = {{ type_counts.values() | list | tojson }};
+new Chart(document.getElementById('typeChart'), {
+  type: 'bar',
+  data: {
+    labels,
+    datasets: [{
+      label: 'Находок',
+      data: values,
+      backgroundColor: 'rgba(220,53,69,0.7)',
+      borderColor: 'rgba(220,53,69,1)',
+      borderWidth: 1
+    }]
+  },
+  options: {
+    indexAxis: 'y',
+    responsive: true,
+    plugins: { legend: { display: false }},
+    scales: { x: { beginAtZero: true }}
+  }
+});
+
+// Danger Zone — кнопки рендерятся только для admin, поэтому всё ниже под проверкой.
+const _btnMaskEl = document.getElementById('btnMask');
+const _btnDumpEl = document.getElementById('btnDump');
+if (_btnMaskEl && _btnDumpEl) {
+  document.getElementById('confirmMask').addEventListener('change', function() {
+    _btnMaskEl.disabled = !this.checked;
+  });
+
+  async function postAction(url, mode) {
+    return await fetch(url, {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({mode})});
+  }
+
+  _btnMaskEl.addEventListener('click', async () => {
+    const mode = document.getElementById('maskMode').value;
+    const btn  = _btnMaskEl;
+    btn.disabled = true; btn.textContent = 'Обезличиваю…';
+    const div = document.getElementById('maskResult');
+    div.replaceChildren();
+    try {
+      const r   = await postAction('/results/mask', mode);
+      const res = await r.json();
+      if (res.ok) {
+        const alertBox = document.createElement('div');
+        alertBox.className = 'alert alert-success py-2';
+        alertBox.appendChild(document.createTextNode(`✅ Обезличено ${res.count} записей. `));
+        const link = document.createElement('a');
+        link.href = '/scan';
+        link.textContent = 'Повторить сканирование';
+        alertBox.appendChild(link);
+        div.appendChild(alertBox);
+      } else {
+        const alertBox = document.createElement('div');
+        alertBox.className = 'alert alert-danger py-2';
+        alertBox.textContent = 'Ошибка: ' + (res.error || 'неизвестно');
+        div.appendChild(alertBox);
+        btn.disabled = false;
+        btn.innerHTML = '<i class="bi bi-eraser-fill"></i> Обезличить';
+      }
+    } catch (err) {
+      const alertBox = document.createElement('div');
+      alertBox.className = 'alert alert-danger py-2';
+      alertBox.textContent = 'Сетевая ошибка: ' + err.message;
+      div.appendChild(alertBox);
+      btn.disabled = false;
+      btn.innerHTML = '<i class="bi bi-eraser-fill"></i> Обезличить';
+    }
+  });
+
+  _btnDumpEl.addEventListener('click', async () => {
+    const mode = document.getElementById('maskMode').value;
+    const btn  = _btnDumpEl;
+    btn.disabled = true; btn.textContent = 'Генерирую дамп…';
+    try {
+      const r = await fetch('/results/dump', {method:'POST',
+        headers:{'Content-Type':'application/json'}, body: JSON.stringify({mode})});
+      if (r.ok) {
+        const blob = await r.blob();
+        const a    = document.createElement('a');
+        a.href     = URL.createObjectURL(blob);
+        a.download = 'sanitized_dump.sql';
+        a.click();
+      } else {
+        alert('Ошибка генерации дампа');
+      }
+    } catch (err) {
+      alert('Сетевая ошибка: ' + err.message);
+    }
+    btn.disabled = false;
+    btn.innerHTML = '<i class="bi bi-box-arrow-down"></i> Дамп (безопасный)';
+  });
+}
+{% endif %}
+</script>
+{% endblock %}

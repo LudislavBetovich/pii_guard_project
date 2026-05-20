@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% block title %}Разметка данных{% endblock %}
+
+{% block content %}
+{% set _can_edit = session.user_role in ['admin', 'analyst'] %}
+<div class="card shadow-sm">
+  <div class="card-header bg-dark text-white small d-flex justify-content-between align-items-center">
+    <span><i class="bi bi-tags-fill"></i> Разметка колонок (Data Governance)</span>
+    {% if _can_edit %}
+      <button class="btn btn-sm btn-success" id="btnSave">
+        <i class="bi bi-floppy-fill"></i> Сохранить изменения
+      </button>
+    {% else %}
+      <span class="badge bg-secondary"><i class="bi bi-eye-fill me-1"></i>только просмотр</span>
+    {% endif %}
+  </div>
+  <div class="card-body p-0">
+    <div class="alert alert-info m-3 py-2 small mb-0">
+      <b>AUTO</b> — умный поиск (пропускает технические поля) &nbsp;|&nbsp;
+      <b>IGNORE</b> — не сканировать &nbsp;|&nbsp;
+      <b>FORCE_PII</b> — принудительно считать угрозой
+    </div>
+    <div class="table-responsive" style="max-height:600px;overflow-y:auto">
+      <table class="table table-sm table-hover mb-0" id="govTable">
+        <thead class="table-dark sticky-top">
+          <tr>
+            <th>Таблица</th><th>Колонка</th><th>Тип БД</th>
+            <th style="min-width:140px">Статус</th>
+            <th style="min-width:180px">Тип PII (если Force)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+          <tr data-table="{{ row.table }}" data-col="{{ row.column }}">
+            <td><code>{{ row.table }}</code></td>
+            <td><code>{{ row.column }}</code></td>
+            <td><span class="text-muted small">{{ row.db_type }}</span></td>
+            <td>
+              <select class="form-select form-select-sm status-sel" onchange="onStatusChange(this)"
+                      {% if not _can_edit %}disabled{% endif %}>
+                {% for s in ['AUTO','IGNORE','FORCE_PII'] %}
+                <option value="{{ s }}" {% if row.status == s %}selected{% endif %}>{{ s }}</option>
+                {% endfor %}
+              </select>
+            </td>
+            <td>
+              <select class="form-select form-select-sm pii-sel"
+                      {% if row.status != 'FORCE_PII' or not _can_edit %}disabled{% endif %}>
+                <option value="">— не выбран —</option>
+                {% for t in pii_types %}
+                <option value="{{ t }}" {% if row.pii_type == t %}selected{% endif %}>{{ t }}</option>
+                {% endfor %}
+              </select>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div id="saveResult" class="mt-2"></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function onStatusChange(sel) {
+  const piiSel = sel.closest('tr').querySelector('.pii-sel');
+  piiSel.disabled = (sel.value !== 'FORCE_PII');
+  if (piiSel.disabled) piiSel.value = '';
+}
+
+// Кнопка существует только для admin/analyst — поэтому обработчик навешиваем
+// только при её наличии, чтобы у viewer не было null-ошибки в консоли.
+const _btnSaveEl = document.getElementById('btnSave');
+if (_btnSaveEl) {
+  _btnSaveEl.addEventListener('click', async () => {
+    const updates = [];
+    document.querySelectorAll('#govTable tbody tr').forEach(tr => {
+      const status  = tr.querySelector('.status-sel').value;
+      const piiType = tr.querySelector('.pii-sel').value;
+      updates.push({
+        table:  tr.dataset.table,
+        col:    tr.dataset.col,
+        status: status,
+        type:   status === 'FORCE_PII' ? piiType : null,
+      });
+    });
+
+    _btnSaveEl.disabled = true; _btnSaveEl.textContent = 'Сохраняю…';
+    const div = document.getElementById('saveResult');
+    div.replaceChildren();
+    try {
+      const r   = await fetch('/governance', {method:'POST',
+        headers:{'Content-Type':'application/json'}, body: JSON.stringify({updates})});
+      const res = await r.json();
+      const box = document.createElement('div');
+      box.className = 'alert py-2 ' + (res.ok ? 'alert-success' : 'alert-danger');
+      box.textContent = res.ok ? '✅ Настройки сохранены' : 'Ошибка при сохранении';
+      div.appendChild(box);
+    } catch (err) {
+      const box = document.createElement('div');
+      box.className = 'alert alert-danger py-2';
+      box.textContent = 'Сетевая ошибка: ' + err.message;
+      div.appendChild(box);
+    }
+    _btnSaveEl.disabled = false;
+    _btnSaveEl.innerHTML = '<i class="bi bi-floppy-fill"></i> Сохранить изменения';
+    setTimeout(() => div.replaceChildren(), 3000);
+  });
+}
+</script>
+{% endblock %}

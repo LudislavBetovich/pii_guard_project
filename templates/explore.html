@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}Исследование БД{% endblock %}
+
+{% block content %}
+<div class="row g-3">
+
+  <!-- ER-диаграмма -->
+  <div class="col-12">
+    <div class="card shadow-sm">
+      <div class="card-header bg-dark text-white small">
+        <i class="bi bi-diagram-3-fill"></i> ER-диаграмма — <code class="text-white">{{ db_name }}</code>
+      </div>
+      <div class="card-body p-2 overflow-auto" style="max-height:420px">
+        {% if svg %}
+          {{ svg | safe }}
+        {% else %}
+          <p class="text-muted text-center mt-4">Нет таблиц или нет соединения с БД.</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <!-- Инспектор таблицы -->
+  <div class="col-lg-3">
+    <div class="card shadow-sm">
+      <div class="card-header bg-dark text-white small"><i class="bi bi-list-ul"></i> Таблицы</div>
+      <div class="list-group list-group-flush" style="max-height:400px;overflow-y:auto">
+        {% for t in table_names %}
+        <button type="button"
+                class="list-group-item list-group-item-action small table-btn"
+                data-name="{{ t }}">
+          <i class="bi bi-table text-primary"></i> {{ t }}
+        </button>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-9">
+    <div class="card shadow-sm" id="tableDetail" style="display:none">
+      <div class="card-header bg-dark text-white small d-flex justify-content-between">
+        <span><i class="bi bi-info-circle"></i> <span id="detailName"></span></span>
+        <span>
+          <span class="badge bg-secondary" id="detailRows"></span>
+          <span class="badge bg-info text-dark ms-1" id="detailSize"></span>
+        </span>
+      </div>
+      <div class="card-body">
+        <h6 class="small fw-semibold">Структура полей</h6>
+        <div class="table-responsive mb-3">
+          <table class="table table-sm table-bordered mb-0" id="colsTable">
+            <thead class="table-light"><tr><th>Колонка</th><th>Тип</th><th>NULL?</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <h6 class="small fw-semibold">Предпросмотр (5 строк)</h6>
+        <div class="table-responsive" id="sampleWrap" style="overflow-x:auto"></div>
+      </div>
+    </div>
+    <div id="tableHint" class="text-muted text-center mt-5">
+      <i class="bi bi-arrow-left-circle fs-2"></i><br>Выберите таблицу для просмотра
+    </div>
+  </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Все имена колонок и значения ячеек строим через textContent: имена приходят
+// из information_schema, значения — из произвольных пользовательских таблиц.
+// innerHTML на этих данных = stored XSS на любую запись с <script>.
+document.querySelectorAll('.table-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    document.querySelectorAll('.table-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const name = btn.dataset.name;
+    const r    = await fetch(`/explore/table/${encodeURIComponent(name)}`);
+    const d    = await r.json();
+
+    document.getElementById('detailName').textContent = name;
+    document.getElementById('detailRows').textContent = `${d.rows} строк`;
+    document.getElementById('detailSize').textContent = d.size;
+
+    // Колонки
+    const tbody = document.querySelector('#colsTable tbody');
+    tbody.replaceChildren();
+    d.columns.forEach(([col, type, nullable]) => {
+      const tr = document.createElement('tr');
+      const tdCol = document.createElement('td');
+      const code = document.createElement('code');
+      code.textContent = String(col);
+      tdCol.appendChild(code);
+      tr.appendChild(tdCol);
+      const tdType = document.createElement('td'); tdType.textContent = String(type); tr.appendChild(tdType);
+      const tdNul  = document.createElement('td'); tdNul.textContent  = String(nullable); tr.appendChild(tdNul);
+      tbody.appendChild(tr);
+    });
+
+    // Превью
+    const wrap = document.getElementById('sampleWrap');
+    wrap.replaceChildren();
+    if (!d.sample || !d.sample.length) {
+      const p = document.createElement('p');
+      p.className = 'text-muted small';
+      p.textContent = 'Таблица пуста.';
+      wrap.appendChild(p);
+    } else {
+      const keys = Object.keys(d.sample[0]);
+      const table = document.createElement('table');
+      table.className = 'table table-sm table-striped mb-0';
+      const thead = document.createElement('thead');
+      thead.className = 'table-dark';
+      const trh = document.createElement('tr');
+      keys.forEach(k => { const th = document.createElement('th'); th.textContent = String(k); trh.appendChild(th); });
+      thead.appendChild(trh);
+      table.appendChild(thead);
+
+      const tbody2 = document.createElement('tbody');
+      d.sample.forEach(row => {
+        const tr = document.createElement('tr');
+        keys.forEach(k => {
+          const td = document.createElement('td');
+          td.className = 'text-truncate';
+          td.style.maxWidth = '150px';
+          const v = row[k];
+          td.textContent = (v === null || v === undefined) ? '' : String(v);
+          tr.appendChild(td);
+        });
+        tbody2.appendChild(tr);
+      });
+      table.appendChild(tbody2);
+      wrap.appendChild(table);
+    }
+
+    document.getElementById('tableDetail').style.display = '';
+    document.getElementById('tableHint').style.display   = 'none';
+  });
+});
+</script>
+{% endblock %}

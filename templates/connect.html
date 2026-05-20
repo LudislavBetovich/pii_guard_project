@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}Подключение{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center mt-4">
+  <div class="col-md-5">
+    <div class="card shadow-sm">
+      <div class="card-header bg-dark text-white">
+        <i class="bi bi-plug-fill"></i> Подключение к PostgreSQL
+      </div>
+      <div class="card-body">
+
+        {% if error %}
+          <div class="alert alert-danger"><i class="bi bi-exclamation-triangle-fill"></i> {{ error }}</div>
+        {% endif %}
+
+        <button class="btn btn-outline-secondary btn-sm w-100 mb-3" id="btnEnv">
+          <i class="bi bi-box-arrow-in-down"></i> Загрузить из ENV (Docker)
+        </button>
+
+        <form method="post" id="connectForm">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <div class="mb-2">
+            <label class="form-label small fw-semibold">Хост</label>
+            <input class="form-control" name="host" id="fHost" value="localhost" required>
+          </div>
+          <div class="mb-2">
+            <label class="form-label small fw-semibold">Порт</label>
+            <input class="form-control" name="port" id="fPort" value="5432" required>
+          </div>
+          <div class="mb-2">
+            <label class="form-label small fw-semibold">База данных</label>
+            <input class="form-control" name="dbname" id="fDbname" required>
+          </div>
+          <div class="mb-2">
+            <label class="form-label small fw-semibold">Пользователь</label>
+            <input class="form-control" name="user" id="fUser" required>
+          </div>
+          <div class="mb-3">
+            <label class="form-label small fw-semibold">Пароль</label>
+            <input class="form-control" name="password" id="fPassword" type="password">
+          </div>
+          <div class="form-check mb-3">
+            <input class="form-check-input" type="checkbox" name="ssl" id="fSsl">
+            <label class="form-check-label small" for="fSsl">Использовать SSL (Render / Cloud)</label>
+          </div>
+
+          <div class="d-grid gap-2">
+            <button type="button" class="btn btn-outline-primary" id="btnTest">
+              <i class="bi bi-lightning"></i> Тест соединения
+            </button>
+            <button type="submit" class="btn btn-primary">
+              <i class="bi bi-check2-circle"></i> Подключиться
+            </button>
+          </div>
+        </form>
+
+        <div id="testResult" class="mt-2"></div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Загрузить из ENV
+document.getElementById('btnEnv').addEventListener('click', async () => {
+  const r = await fetch('/connect/env');
+  const d = await r.json();
+  document.getElementById('fHost').value   = d.host;
+  document.getElementById('fPort').value   = d.port;
+  document.getElementById('fDbname').value = d.dbname;
+  document.getElementById('fUser').value   = d.user;
+  document.getElementById('fPassword').value = d.password;
+});
+
+// Тест без сохранения
+document.getElementById('btnTest').addEventListener('click', async () => {
+  const btn = document.getElementById('btnTest');
+  btn.disabled = true; btn.textContent = 'Проверяю...';
+  const payload = {
+    host:     document.getElementById('fHost').value,
+    port:     document.getElementById('fPort').value,
+    dbname:   document.getElementById('fDbname').value,
+    user:     document.getElementById('fUser').value,
+    password: document.getElementById('fPassword').value,
+    ssl:      document.getElementById('fSsl').checked,
+  };
+  const r   = await fetch('/connect/test', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+  const res = await r.json();
+  const div = document.getElementById('testResult');
+  // textContent — иначе сообщение от сервера (например, ошибка psycopg2 с
+  // именем колонки/таблицы из БД) могло бы внедрить HTML.
+  div.innerHTML = '';
+  const alertBox = document.createElement('div');
+  alertBox.className = res.ok ? 'alert alert-success py-2' : 'alert alert-danger py-2';
+  const icon = document.createElement('i');
+  icon.className = res.ok ? 'bi bi-check-circle-fill' : 'bi bi-x-circle-fill';
+  alertBox.appendChild(icon);
+  alertBox.appendChild(document.createTextNode(' ' + (res.message || '')));
+  div.appendChild(alertBox);
+  btn.disabled = false; btn.innerHTML = '<i class="bi bi-lightning"></i> Тест соединения';
+});
+</script>
+{% endblock %}

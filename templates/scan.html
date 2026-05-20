@@ -1,0 +1,325 @@
+{% extends "base.html" %}
+{% block title %}Сканер{% endblock %}
+
+{% block content %}
+<div class="row g-3">
+
+  <!-- ── Левая колонка: параметры ── -->
+  <div class="col-lg-3">
+
+    <!-- Глубина сканирования -->
+    <div class="card mb-3 shadow-sm">
+      <div class="card-header bg-dark text-white small"><i class="bi bi-sliders"></i> Параметры</div>
+      <div class="card-body">
+        <label class="form-label small fw-semibold">Глубина сканирования (строк): <span id="depthVal">2000</span></label>
+        <input type="range" class="form-range" id="scanDepth" min="100" max="50000" step="100" value="2000">
+        <label class="form-label small fw-semibold mt-2">Исключить таблицы:</label>
+        <select class="form-select form-select-sm" id="excludedTables" multiple style="height:120px">
+          {% for t in tables %}<option value="{{ t }}">{{ t }}</option>{% endfor %}
+        </select>
+        <div class="text-muted small mt-1">Ctrl+Click для выбора нескольких</div>
+      </div>
+    </div>
+
+    <!-- Анализ метаданных -->
+    <div class="card mb-3 shadow-sm">
+      <div class="card-header bg-dark text-white small"><i class="bi bi-search"></i> Анализ метаданных</div>
+      <div class="card-body">
+        <button class="btn btn-sm btn-outline-secondary w-100" id="btnMeta">Проверить названия колонок</button>
+        <div id="metaResult" class="mt-2"></div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Правая колонка: паттерны + запуск ── -->
+  <div class="col-lg-9">
+
+    <!-- Паттерны -->
+    <div class="card mb-3 shadow-sm">
+      <div class="card-header bg-dark text-white small d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-ui-checks"></i> Активные паттерны поиска</span>
+        <div>
+          <button class="btn btn-sm btn-outline-light me-1" id="btnSelAll">Выбрать все</button>
+          <button class="btn btn-sm btn-outline-light" id="btnSelNone">Снять все</button>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="row row-cols-2 row-cols-md-3 g-1" id="patternList">
+          {% for name in patterns %}
+          <div class="col">
+            <div class="form-check">
+              <input class="form-check-input pat-check" type="checkbox" value="{{ name }}" id="pat_{{ loop.index }}" checked>
+              <label class="form-check-label small" for="pat_{{ loop.index }}">{{ name }}</label>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+
+    <!-- Свои критерии -->
+    <div class="card mb-3 shadow-sm">
+      <div class="card-header bg-dark text-white small">
+        <i class="bi bi-plus-circle"></i> Свои критерии
+        <button class="btn btn-sm btn-outline-light float-end" type="button"
+                data-bs-toggle="collapse" data-bs-target="#customBlock">Развернуть</button>
+      </div>
+      <div class="collapse" id="customBlock">
+        <div class="card-body">
+          <ul class="nav nav-tabs mb-3" id="customTabs">
+            <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tabWord">Слово</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabRegex">RegEx</button></li>
+          </ul>
+          <div class="tab-content">
+            <div class="tab-pane fade show active" id="tabWord">
+              <div class="input-group input-group-sm">
+                <input class="form-control" id="wordInput" placeholder="Секретно">
+                <button class="btn btn-outline-primary" id="btnAddWord">Добавить</button>
+              </div>
+            </div>
+            <div class="tab-pane fade" id="tabRegex">
+              <div class="input-group input-group-sm mb-2">
+                <input class="form-control" id="regexName" placeholder="Название">
+                <input class="form-control" id="regexVal"  placeholder="RegEx паттерн">
+                <button class="btn btn-outline-primary" id="btnAddRegex">Добавить</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Список пользовательских паттернов -->
+          <div id="customList" class="mt-2">
+            {% for name, regex in custom_patterns.items() %}
+            <div class="d-flex align-items-center gap-2 mb-1 custom-pat-row" data-name="{{ name }}">
+              <input class="form-check-input pat-check" type="checkbox" value="{{ name }}" checked>
+              <span class="small flex-grow-1"><b>{{ name }}</b> <code class="text-muted">{{ regex[:60] }}</code></span>
+              <button class="btn btn-sm btn-outline-danger btn-del-custom" data-name="{{ name }}">×</button>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Кнопка запуска: viewer'у запрещено, скрываем UI -->
+    {% if session.user_role in ['admin', 'analyst'] %}
+    <div class="d-grid mb-3">
+      <button class="btn btn-primary btn-lg" id="btnScan">
+        <i class="bi bi-play-circle-fill"></i> Запустить сканирование
+      </button>
+    </div>
+    {% else %}
+    <div class="alert alert-secondary">
+      <i class="bi bi-info-circle me-2"></i>
+      Запуск сканирования доступен только аналитику или администратору.
+    </div>
+    {% endif %}
+
+    <!-- Прогресс (скрыт до старта) -->
+    <div class="card shadow-sm d-none" id="progressCard">
+      <div class="card-body">
+        <h6 class="mb-3"><i class="bi bi-hourglass-split"></i> Сканирование…</h6>
+        <div class="progress mb-2" style="height:22px">
+          <div id="progressBar" class="progress-bar progress-bar-striped progress-bar-animated bg-primary"
+               style="width:0%">0%</div>
+        </div>
+        <small id="progressText" class="text-muted"></small>
+      </div>
+    </div>
+
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ── Глубина ──
+const depthInput = document.getElementById('scanDepth');
+depthInput.addEventListener('input', () => {
+  document.getElementById('depthVal').textContent = Number(depthInput.value).toLocaleString();
+});
+
+// ── Выбрать/снять все паттерны ──
+document.getElementById('btnSelAll').addEventListener('click',  () =>
+  document.querySelectorAll('.pat-check').forEach(c => c.checked = true));
+document.getElementById('btnSelNone').addEventListener('click', () =>
+  document.querySelectorAll('.pat-check').forEach(c => c.checked = false));
+
+// ── Метаданные ──
+document.getElementById('btnMeta').addEventListener('click', async () => {
+  const btn = document.getElementById('btnMeta');
+  btn.disabled = true; btn.textContent = 'Анализирую…';
+  const div  = document.getElementById('metaResult');
+  div.replaceChildren();
+  try {
+    const r    = await fetch('/scan/metadata');
+    const hints = await r.json();
+    if (!hints.length) {
+      const s = document.createElement('small');
+      s.className = 'text-success';
+      s.textContent = 'Подозрительных названий не найдено.';
+      div.appendChild(s);
+    } else {
+      const head = document.createElement('small');
+      head.className = 'text-warning';
+      head.textContent = `Найдено ${hints.length} подозрительных колонок:`;
+      div.appendChild(head);
+      const ul = document.createElement('ul');
+      ul.className = 'small mt-1 ps-3';
+      hints.slice(0, 15).forEach(h => {
+        const li = document.createElement('li');
+        const b = document.createElement('b');
+        b.textContent = `${h.table}.${h.column}`;
+        li.appendChild(b);
+        li.appendChild(document.createTextNode(' → ' + (h.suspected_type || '')));
+        ul.appendChild(li);
+      });
+      div.appendChild(ul);
+    }
+  } catch (err) {
+    const s = document.createElement('small');
+    s.className = 'text-danger';
+    s.textContent = 'Ошибка: ' + err.message;
+    div.appendChild(s);
+  }
+  btn.disabled = false; btn.textContent = 'Проверить названия колонок';
+});
+
+// ── Добавить слово ──
+document.getElementById('btnAddWord').addEventListener('click', async () => {
+  const word = document.getElementById('wordInput').value.trim();
+  if (!word) return;
+  const name  = `Слово: ${word}`;
+  const regex = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  await addCustomPattern(name, regex);
+  document.getElementById('wordInput').value = '';
+});
+
+// ── Добавить RegEx ──
+document.getElementById('btnAddRegex').addEventListener('click', async () => {
+  const name  = document.getElementById('regexName').value.trim();
+  const regex = document.getElementById('regexVal').value.trim();
+  if (!name || !regex) return alert('Укажите название и паттерн');
+  await addCustomPattern(name, regex);
+  document.getElementById('regexName').value = '';
+  document.getElementById('regexVal').value  = '';
+});
+
+async function addCustomPattern(name, regex) {
+  await fetch('/patterns/add', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name, regex})});
+  // Имя и regex задаёт сам пользователь — раньше шли через innerHTML, что
+  // позволяло заинжектить <script> через "название" собственного паттерна.
+  const div = document.createElement('div');
+  div.className = 'd-flex align-items-center gap-2 mb-1 custom-pat-row';
+  div.dataset.name = name;
+
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.className = 'form-check-input pat-check';
+  cb.value = name;
+  cb.checked = true;
+  div.appendChild(cb);
+
+  const span = document.createElement('span');
+  span.className = 'small flex-grow-1';
+  const b = document.createElement('b');
+  b.textContent = name;
+  span.appendChild(b);
+  span.appendChild(document.createTextNode(' '));
+  const code = document.createElement('code');
+  code.className = 'text-muted';
+  code.textContent = regex.slice(0, 60);
+  span.appendChild(code);
+  div.appendChild(span);
+
+  const btn = document.createElement('button');
+  btn.className = 'btn btn-sm btn-outline-danger btn-del-custom';
+  btn.dataset.name = name;
+  btn.textContent = '×';
+  btn.addEventListener('click', deleteCustom);
+  div.appendChild(btn);
+
+  document.getElementById('customList').appendChild(div);
+}
+
+// ── Удалить кастомный паттерн ──
+document.querySelectorAll('.btn-del-custom').forEach(b =>
+  b.addEventListener('click', deleteCustom));
+
+async function deleteCustom(e) {
+  const name = e.currentTarget.dataset.name;
+  await fetch('/patterns/delete', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name})});
+  document.querySelector(`.custom-pat-row[data-name="${name}"]`)?.remove();
+}
+
+// ── Запуск сканирования ── (кнопки нет для viewer'а)
+const _btnScanEl = document.getElementById('btnScan');
+if (_btnScanEl) {
+  _btnScanEl.addEventListener('click', async () => {
+    const selected = [...document.querySelectorAll('.pat-check:checked')].map(c => c.value);
+    if (!selected.length) return alert('Выберите хотя бы один паттерн');
+
+    const excluded = [...document.getElementById('excludedTables').selectedOptions].map(o => o.value);
+    const limit    = parseInt(document.getElementById('scanDepth').value);
+    const payload  = {excluded_tables: excluded, selected_patterns: selected, limit_rows: limit};
+
+    _btnScanEl.disabled = true;
+    document.getElementById('progressCard').classList.remove('d-none');
+
+    try {
+      const r = await fetch('/scan/start', {method:'POST',
+        headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+      const res = await r.json();
+      if (!res.ok) {
+        alert(res.error || 'Ошибка запуска');
+        _btnScanEl.disabled = false;
+        return;
+      }
+      pollStatus();
+    } catch (err) {
+      alert('Сетевая ошибка: ' + err.message);
+      _btnScanEl.disabled = false;
+    }
+  });
+}
+
+function pollStatus() {
+  const bar  = document.getElementById('progressBar');
+  const text = document.getElementById('progressText');
+  let consecutiveErrors = 0;
+  const iv   = setInterval(async () => {
+    try {
+      const r   = await fetch('/scan/status');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const s   = await r.json();
+      consecutiveErrors = 0;
+      const pct = s.progress + '%';
+      bar.style.width   = pct;
+      bar.textContent   = pct;
+      text.textContent  = s.current_table
+        ? `Таблица: ${s.current_table} | Колонка: ${s.current_col}`
+        : '';
+      if (s.status === 'done') {
+        clearInterval(iv);
+        window.location.href = '/results';
+      } else if (s.status === 'error') {
+        clearInterval(iv);
+        alert('Ошибка сканирования: ' + s.error);
+        document.getElementById('btnScan').disabled = false;
+      }
+    } catch (err) {
+      // Сеть упала или сервер перезапустился — не крутим интервал бесконечно.
+      consecutiveErrors += 1;
+      text.textContent = 'Ошибка опроса: ' + err.message;
+      if (consecutiveErrors >= 5) {
+        clearInterval(iv);
+        document.getElementById('btnScan').disabled = false;
+        alert('Потеряна связь со сканером. Перезапустите сканирование.');
+      }
+    }
+  }, 1500);
+}
+</script>
+{% endblock %}

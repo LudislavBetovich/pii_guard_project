@@ -1,0 +1,332 @@
+{% extends "base.html" %}
+{% block title %}Дашборд безопасности{% endblock %}
+
+{% block content %}
+
+<!-- Карточки-метрики (24 ч) -->
+<div class="row g-3 mb-4">
+  {% if connected %}
+  <div class="col-6 col-md-3">
+    <div class="card text-white bg-dark h-100 shadow-sm">
+      <div class="card-body text-center">
+        <div class="display-6 fw-bold">{{ stats.get('total', 0) }}</div>
+        <div class="small text-secondary mt-1"><i class="bi bi-shield-fill me-1"></i>Событий безопасности</div>
+        <div class="text-muted" style="font-size:.7rem">за последние 24 ч</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card text-white h-100 shadow-sm {{ 'bg-danger' if stats.get('login_failed', 0) > 0 else 'bg-secondary' }}">
+      <div class="card-body text-center">
+        <div class="display-6 fw-bold">{{ stats.get('login_failed', 0) }}</div>
+        <div class="small mt-1"><i class="bi bi-shield-x me-1"></i>Неудачных входов</div>
+        <div style="font-size:.7rem;opacity:.8">LOGIN_FAILED · 24 ч</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card text-white bg-primary h-100 shadow-sm">
+      <div class="card-body text-center">
+        <div class="display-6 fw-bold">{{ stats.get('scans', 0) }}</div>
+        <div class="small mt-1"><i class="bi bi-radar me-1"></i>Сканирований</div>
+        <div style="font-size:.7rem;opacity:.8">SCAN · 24 ч</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card text-white bg-warning h-100 shadow-sm">
+      <div class="card-body text-center">
+        <div class="display-6 fw-bold text-dark">{{ stats.get('masking', 0) }}</div>
+        <div class="small mt-1 text-dark"><i class="bi bi-incognito me-1"></i>Маскирований</div>
+        <div style="font-size:.7rem;opacity:.7" class="text-dark">MASK · 24 ч</div>
+      </div>
+    </div>
+  </div>
+  {% else %}
+  <div class="col-12">
+    <div class="alert alert-warning">
+      <i class="bi bi-plug-fill me-2"></i>Подключитесь к БД для просмотра событий безопасности.
+      <a href="/connect" class="alert-link ms-2">Подключиться →</a>
+    </div>
+  </div>
+  {% endif %}
+</div>
+
+{% if connected %}
+
+<!-- Верификация цепочки -->
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-dark text-white d-flex align-items-center gap-2">
+    <i class="bi bi-link-45deg"></i>
+    <strong>Целостность журнала аудита (hash-chain)</strong>
+    <button id="btn-verify" class="btn btn-sm btn-outline-light ms-auto" onclick="verifyChain()">
+      <i class="bi bi-check2-circle me-1"></i>Проверить
+    </button>
+  </div>
+  <div class="card-body">
+    <div id="verify-result" class="text-muted small">
+      Нажмите «Проверить» для верификации SHA-256 цепочки журнала.
+    </div>
+  </div>
+</div>
+
+<!-- Фильтры + таблица событий -->
+<div class="card shadow-sm">
+  <div class="card-header bg-dark text-white d-flex align-items-center gap-2">
+    <i class="bi bi-funnel-fill"></i><strong>События безопасности</strong>
+    <span id="events-count" class="badge bg-secondary ms-auto">—</span>
+  </div>
+  <div class="card-body border-bottom pb-3">
+    <div class="row g-2">
+      <div class="col-md-3">
+        <select id="f-operation" class="form-select form-select-sm">
+          <option value="">— Все операции —</option>
+          <option>LOGIN</option>
+          <option>LOGIN_FAILED</option>
+          <option>LOGOUT</option>
+          <option>SCAN</option>
+          <option>MASS_MASKING</option>
+          <option>MASS_FAKER</option>
+          <option>DUMP</option>
+          <option>GOVERNANCE_UPDATE</option>
+          <option>USER_CREATED</option>
+          <option>USER_DELETED</option>
+        </select>
+      </div>
+      <div class="col-md-3">
+        <input id="f-user" type="text" class="form-control form-control-sm"
+               placeholder="Пользователь (фильтр)">
+      </div>
+      <div class="col-md-2">
+        <input id="f-from" type="date" class="form-control form-control-sm">
+      </div>
+      <div class="col-md-2">
+        <input id="f-to" type="date" class="form-control form-control-sm">
+      </div>
+      <div class="col-md-2 d-flex gap-2">
+        <button class="btn btn-sm btn-primary flex-fill" onclick="loadEvents(0)">
+          <i class="bi bi-search"></i> Найти
+        </button>
+        <button class="btn btn-sm btn-outline-secondary" onclick="resetFilters()">
+          <i class="bi bi-x"></i>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div class="table-responsive" style="max-height:520px;overflow-y:auto">
+    <table class="table table-hover table-sm mb-0">
+      <thead class="table-dark sticky-top">
+        <tr>
+          <th>Время</th>
+          <th>Операция</th>
+          <th>Пользователь</th>
+          <th>IP</th>
+          <th>Детали</th>
+          <th>Hash (prefix)</th>
+        </tr>
+      </thead>
+      <tbody id="events-body">
+        <tr><td colspan="6" class="text-center text-muted py-3">Загрузка…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Пагинация -->
+  <div class="card-footer d-flex justify-content-between align-items-center py-2">
+    <button id="btn-prev" class="btn btn-sm btn-outline-secondary" onclick="changePage(-1)" disabled>
+      <i class="bi bi-chevron-left"></i> Назад
+    </button>
+    <span id="page-info" class="text-muted small">стр. 1</span>
+    <button id="btn-next" class="btn btn-sm btn-outline-secondary" onclick="changePage(1)">
+      Вперёд <i class="bi bi-chevron-right"></i>
+    </button>
+  </div>
+</div>
+
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+const PAGE_SIZE = 50;
+let currentOffset = 0;
+
+// bg-purple / bg-teal в Bootstrap нет — невидимый badge на белом фоне.
+// Заменено на штатные классы.
+const OPERATION_BADGES = {
+  'LOGIN':            'bg-success',
+  'LOGIN_FAILED':     'bg-danger',
+  'LOGOUT':           'bg-secondary',
+  'SCAN':             'bg-primary',
+  'MASS_MASKING':     'bg-warning text-dark',
+  'MASS_FAKER':       'bg-warning text-dark',
+  'DUMP':             'bg-info text-dark',
+  'GOVERNANCE_UPDATE':'bg-info text-white',
+  'USER_CREATED':     'bg-success',
+  'USER_DELETED':     'bg-danger',
+};
+
+function makeOpBadge(op) {
+  const cls = OPERATION_BADGES[op] || 'bg-secondary';
+  const span = document.createElement('span');
+  span.className = 'badge ' + cls;
+  span.textContent = op || '—';
+  return span;
+}
+
+function loadEvents(offset) {
+  currentOffset = offset;
+  const params = new URLSearchParams({
+    operation: document.getElementById('f-operation').value,
+    db_user:   document.getElementById('f-user').value,
+    date_from: document.getElementById('f-from').value,
+    date_to:   document.getElementById('f-to').value,
+    offset:    offset,
+  });
+  fetch(`/security/events?${params}`)
+    .then(r => r.json())
+    .then(rows => {
+      const tbody = document.getElementById('events-body');
+      tbody.replaceChildren();
+      document.getElementById('events-count').textContent = rows.length < PAGE_SIZE
+        ? rows.length : `${rows.length}+`;
+      document.getElementById('page-info').textContent =
+        `стр. ${Math.floor(offset / PAGE_SIZE) + 1}`;
+      document.getElementById('btn-prev').disabled = offset === 0;
+      document.getElementById('btn-next').disabled = rows.length < PAGE_SIZE;
+
+      if (!rows.length) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 6;
+        td.className = 'text-center text-muted py-3';
+        td.textContent = 'Событий не найдено';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+      }
+
+      // Все строки строим через DOM API + textContent — поля r.details/r.client_ip
+      // приходят из журнала аудита БД, где могут оказаться значения, написанные
+      // злоумышленником в сканируемую базу.
+      rows.forEach(r => {
+        const tr = document.createElement('tr');
+
+        const tdTime = document.createElement('td');
+        tdTime.className = 'text-nowrap small text-muted';
+        tdTime.textContent = String(r.time || '').substring(0, 19).replace('T', ' ');
+        tr.appendChild(tdTime);
+
+        const tdOp = document.createElement('td');
+        tdOp.appendChild(makeOpBadge(r.operation));
+        tr.appendChild(tdOp);
+
+        const tdUser = document.createElement('td');
+        tdUser.className = 'small';
+        if (r.app_user) {
+          const s = document.createElement('span');
+          s.className = 'fw-semibold';
+          s.textContent = r.app_user;
+          tdUser.appendChild(s);
+          tdUser.appendChild(document.createTextNode(' '));
+        }
+        if (r.db_user) {
+          const s = document.createElement('span');
+          s.className = 'text-muted';
+          s.textContent = '(' + r.db_user + ')';
+          tdUser.appendChild(s);
+        }
+        tr.appendChild(tdUser);
+
+        const tdIp = document.createElement('td');
+        tdIp.className = 'small text-muted';
+        tdIp.textContent = r.client_ip || '';
+        tr.appendChild(tdIp);
+
+        const tdDetails = document.createElement('td');
+        tdDetails.className = 'small';
+        tdDetails.textContent = r.details || '';
+        tr.appendChild(tdDetails);
+
+        const tdHash = document.createElement('td');
+        const code = document.createElement('code');
+        code.className = 'small text-muted';
+        code.textContent = r.row_hash || '';
+        tdHash.appendChild(code);
+        tr.appendChild(tdHash);
+
+        tbody.appendChild(tr);
+      });
+    })
+    .catch(err => {
+      const tbody = document.getElementById('events-body');
+      tbody.replaceChildren();
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 6;
+      td.className = 'text-center text-danger py-3';
+      td.textContent = 'Ошибка загрузки: ' + err.message;
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    });
+}
+
+function changePage(dir) {
+  loadEvents(Math.max(0, currentOffset + dir * PAGE_SIZE));
+}
+
+function resetFilters() {
+  document.getElementById('f-operation').value = '';
+  document.getElementById('f-user').value = '';
+  document.getElementById('f-from').value = '';
+  document.getElementById('f-to').value = '';
+  loadEvents(0);
+}
+
+function verifyChain() {
+  const btn = document.getElementById('btn-verify');
+  const box = document.getElementById('verify-result');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Проверка…';
+  box.replaceChildren();
+  fetch('/security/verify')
+    .then(r => r.json())
+    .then(data => {
+      const div = document.createElement('div');
+      const icon = document.createElement('i');
+      const strong = document.createElement('strong');
+      if (data.ok) {
+        div.className = 'alert alert-success py-2 mb-0';
+        icon.className = 'bi bi-check-circle-fill me-2';
+        strong.textContent = data.message || 'Целостность OK';
+        div.appendChild(icon);
+        div.appendChild(strong);
+      } else {
+        div.className = 'alert alert-danger py-2 mb-0';
+        icon.className = 'bi bi-x-octagon-fill me-2';
+        strong.textContent = 'Нарушение целостности!';
+        div.appendChild(icon);
+        div.appendChild(strong);
+        div.appendChild(document.createTextNode(' ' + (data.message || '')));
+      }
+      box.appendChild(div);
+    })
+    .catch(e => {
+      const div = document.createElement('div');
+      div.className = 'alert alert-warning py-2 mb-0';
+      div.textContent = 'Ошибка: ' + e.message;
+      box.appendChild(div);
+    })
+    .finally(() => {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="bi bi-check2-circle me-1"></i>Проверить';
+    });
+}
+
+// Загружаем события при открытии страницы
+{% if connected %}
+loadEvents(0);
+{% endif %}
+</script>
+{% endblock %}

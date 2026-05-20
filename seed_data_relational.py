@@ -1,161 +1,275 @@
-import psycopg2
-import random
-from faker import Faker
+"""
+PII Guard — Seed-данные для демонстрации на защите диплома.
+Моделируемая организация: IT-компания «ТехноПром» (HR + финансы + системные аккаунты).
+
+Покрытие детекторов:
+  ✅ Luhn       — номера банковских карт (payroll.card_number)
+  ✅ INN12      — ИНН физлица сотрудников (employees.inn)
+  ✅ INN10      — ИНН юрлиц (companies.inn)
+  ✅ SNILS      — СНИЛС сотрудников (employees.snils)
+  RegEx:  ФИО, дата рождения, email, телефон, паспорт, ОГРН, КПП,
+          IBAN, хэш пароля (BCrypt / MD5), API-ключ, IPv4
+"""
+
 import os
-import backend  # <--- Импортируем наш бэкенд, чтобы вызвать функцию инициализации
+import random
+import string
+import psycopg2
+from faker import Faker
+import backend
 
-# Инициализируем Faker
 fake = Faker('ru_RU')
+random.seed(42)
 
-# Конфигурация (берем из ENV, как и везде)
 DB_CONFIG = {
-    "dbname": os.getenv("POSTGRES_DB", "testdb"),
-    "user": os.getenv("POSTGRES_USER", "admin"),
+    "dbname":   os.getenv("POSTGRES_DB",       "testdb"),
+    "user":     os.getenv("POSTGRES_USER",     "admin"),
     "password": os.getenv("POSTGRES_PASSWORD", "secret_password"),
-    "host": os.getenv("DB_HOST", "localhost"),
-    "port": os.getenv("DB_PORT", "5432")
+    "host":     os.getenv("DB_HOST",           "localhost"),
+    "port":     os.getenv("DB_PORT",           "5432"),
 }
 
+# ── Генераторы с корректными контрольными суммами ─────────────
+
+def gen_inn12() -> str:
+    """ИНН физлица (12 цифр) — правильные контрольные цифры."""
+    w1 = [7, 2, 4, 10, 3, 5, 9, 4, 6, 8]
+    w2 = [3, 7, 2, 4, 10, 3, 5, 9, 4, 6, 8]
+    d = [random.randint(0, 9) for _ in range(10)]
+    c1 = sum(w * d[i] for i, w in enumerate(w1)) % 11 % 10
+    d.append(c1)
+    c2 = sum(w * d[i] for i, w in enumerate(w2)) % 11 % 10
+    d.append(c2)
+    return ''.join(map(str, d))
+
+
+def gen_inn10() -> str:
+    """ИНН юрлица (10 цифр) — правильная контрольная цифра."""
+    weights = [2, 4, 10, 3, 5, 9, 4, 6, 8]
+    d = [random.randint(0, 9) for _ in range(9)]
+    check = sum(w * d[i] for i, w in enumerate(weights)) % 11 % 10
+    return ''.join(map(str, d)) + str(check)
+
+
+def gen_snils() -> str:
+    """СНИЛС (формат NNN-NNN-NNN CC) — правильные контрольные цифры."""
+    while True:
+        d = [random.randint(0, 9) for _ in range(9)]
+        number = int(''.join(map(str, d)))
+        if number < 1001998:          # старые номера — пропускаем
+            continue
+        total = sum((9 - i) * d[i] for i in range(9)) % 101
+        if total >= 100:
+            total = 0
+        p = ''.join(map(str, d))
+        return f'{p[:3]}-{p[3:6]}-{p[6:9]} {total:02d}'
+
+
+def gen_ogrn() -> str:
+    """ОГРН (13 цифр) — правильная контрольная цифра."""
+    d = str(random.randint(100000000000, 999999999999))   # 12 цифр
+    check = int(d) % 11 % 10
+    return d + str(check)
+
+
+def gen_kpp() -> str:
+    """КПП (9 цифр, без контрольной суммы)."""
+    return (f'{random.randint(100, 999)}'
+            f'{random.randint(100, 999)}'
+            f'{random.randint(100, 999)}')
+
+
+def gen_bcrypt_like() -> str:
+    """Строка в формате BCrypt — детектируется паттерном Password Hash (BCrypt)."""
+    chars = string.ascii_letters + string.digits + './'
+    return '$2b$12$' + ''.join(random.choices(chars, k=53))
+
+
+def gen_md5() -> str:
+    """MD5-подобный хэш (32 hex-символа)."""
+    return ''.join(random.choices('0123456789abcdef', k=32))
+
+
+def gen_api_key() -> str:
+    """Generic API Key: 40 символов, обязательно верхний + нижний регистр + цифра."""
+    pool = string.ascii_uppercase + string.ascii_lowercase + string.digits
+    key = (random.choices(string.ascii_uppercase, k=4) +
+           random.choices(string.ascii_lowercase, k=4) +
+           random.choices(string.digits, k=4) +
+           random.choices(pool, k=28))
+    random.shuffle(key)
+    return ''.join(key)
+
+
+def gen_ipv4() -> str:
+    return (f'{random.randint(10, 192)}.'
+            f'{random.randint(0, 255)}.'
+            f'{random.randint(0, 255)}.'
+            f'{random.randint(1, 254)}')
+
+
+# ── Схема базы данных ─────────────────────────────────────────
+
 def create_schema(cur):
-    print("🏗️ Создаю реляционную структуру (с Foreign Keys)...")
-    
-    # 1. Удаляем всё старое (CASCADE удалит и зависимости)
-    # Удаляем и схему pii_guard, чтобы пересоздать её начисто
-    cur.execute("DROP SCHEMA IF EXISTS pii_guard CASCADE;")
-    
-    tables = ["payments", "orders", "profiles", "support_tickets", "users", "products"]
-    for t in tables:
-        cur.execute(f"DROP TABLE IF EXISTS {t} CASCADE;")
+    print('🏗️  Создаю схему (IT-компания «ТехноПром»)…')
 
-    # 2. Таблица Пользователей
+    # Полная очистка: pii_guard пересоздаётся через init_db_security
+    cur.execute('DROP SCHEMA IF EXISTS pii_guard CASCADE;')
+
+    for tbl in ('payroll', 'system_accounts', 'employees', 'companies'):
+        cur.execute(f'DROP TABLE IF EXISTS {tbl} CASCADE;')
+
+    # Компании (головная + дочерние / клиенты)
     cur.execute("""
-        CREATE TABLE users (
-            id SERIAL PRIMARY KEY,
-            username VARCHAR(50) NOT NULL,
-            email VARCHAR(100) NOT NULL,
-            registration_date DATE DEFAULT CURRENT_DATE
+        CREATE TABLE companies (
+            id           SERIAL PRIMARY KEY,
+            company_name TEXT NOT NULL,
+            inn          TEXT,   -- ИНН 10 цифр  ← INN10 валидатор
+            ogrn         TEXT,   -- ОГРН 13 цифр ← RegEx
+            kpp          TEXT    -- КПП 9 цифр   ← RegEx
         );
     """)
 
-    # 3. Таблица Профилей
-# В функции create_schema -> таблица profiles
+    # Сотрудники
     cur.execute("""
-    CREATE TABLE profiles (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER UNIQUE REFERENCES users(id) ON DELETE CASCADE,
-        full_name TEXT, 
-        birth_date TEXT,
-        passport_details TEXT,
-        snils TEXT,
-        address TEXT
+        CREATE TABLE employees (
+            id         SERIAL PRIMARY KEY,
+            company_id INTEGER REFERENCES companies(id),
+            full_name  TEXT,    -- ФИО             ← FIO (RU)
+            birth_date TEXT,    -- дата рождения   ← Date of Birth
+            email      TEXT,    -- email           ← Email
+            phone      TEXT,    -- телефон         ← Phone (RU)
+            passport   TEXT,    -- серия + номер   ← Passport (RU Internal)
+            snils      TEXT,    -- СНИЛС           ← SNILS валидатор
+            inn        TEXT     -- ИНН физлица     ← INN12 валидатор
         );
     """)
 
-    # 4. Таблица Заказов
+    # Зарплатная ведомость
     cur.execute("""
-        CREATE TABLE orders (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-            order_number VARCHAR(20),
-            total_amount DECIMAL(10, 2),
-            created_at TIMESTAMP DEFAULT NOW()
+        CREATE TABLE payroll (
+            id          SERIAL PRIMARY KEY,
+            employee_id INTEGER REFERENCES employees(id),
+            card_number TEXT,           -- карта  ← Credit Card (Luhn)
+            iban        TEXT,           -- IBAN   ← IBAN
+            salary      NUMERIC(12, 2)
         );
     """)
 
-    # 5. Таблица Платежей
+    # Системные аккаунты
     cur.execute("""
-        CREATE TABLE payments (
-            id SERIAL PRIMARY KEY,
-            order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
-            payment_method VARCHAR(20),
-            credit_card_number VARCHAR(20),
-            transaction_status VARCHAR(20)
+        CREATE TABLE system_accounts (
+            id          SERIAL PRIMARY KEY,
+            employee_id INTEGER REFERENCES employees(id),
+            login       TEXT,
+            password_hash TEXT,  -- BCrypt / MD5  ← Password Hash
+            api_key       TEXT,  -- API-ключ      ← Generic API Key
+            last_ip       TEXT   -- IP-адрес      ← IPv4 Address
         );
     """)
+    print('   ✓ Таблицы созданы.')
 
-    # 6. Таблица Поддержки
-    cur.execute("""
-        CREATE TABLE support_tickets (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER REFERENCES users(id),
-            subject VARCHAR(100),
-            message_body TEXT,
-            status VARCHAR(15)
-        );
-    """)
+
+# ── Наполнение данными ────────────────────────────────────────
 
 def generate_data(conn, cur):
-    print("🎲 Генерирую связанные данные...")
-    
-    user_ids = []
-    # --- 1. Users ---
-    for _ in range(200):
-        cur.execute(
-            "INSERT INTO users (username, email) VALUES (%s, %s) RETURNING id",
-            (fake.user_name(), fake.email())
-        )
-        user_ids.append(cur.fetchone()[0])
+    print('🎲 Генерирую данные…')
 
-    # --- 2. Profiles ---
-    for uid in user_ids:
-        snils = f"{random.randint(100,999)}-{random.randint(100,999)}-{random.randint(100,999)} {random.randint(10,99)}"
-        passport = f"{random.randint(1000,9999)} {random.randint(100000,999999)}"
-        dob = fake.date_of_birth(minimum_age=18, maximum_age=90).strftime("%d.%m.%Y")
+    # --- Компании (10 организаций) ---
+    company_ids = []
+    company_names = [
+        'ТехноПром ООО', 'СофтЛайн АО', 'ДатаБридж ООО', 'КиберСистемс ЗАО',
+        'ИнфоТех ООО', 'ПрайматекС АО', 'ДиджиталВэй ООО', 'НетворкПро ЗАО',
+        'КлаудСервис ООО', 'АйТи Решения АО',
+    ]
+    for name in company_names:
         cur.execute(
-    "INSERT INTO profiles (user_id, full_name, birth_date, passport_details, snils, address) VALUES (%s, %s, %s, %s, %s, %s)",
-    (uid, fake.name(), dob, passport, snils, fake.address())
+            'INSERT INTO companies (company_name, inn, ogrn, kpp) VALUES (%s,%s,%s,%s) RETURNING id',
+            (name, gen_inn10(), gen_ogrn(), gen_kpp())
         )
+        company_ids.append(cur.fetchone()[0])
+    print(f'   ✓ Компании: {len(company_ids)}')
 
-    # --- 3. Orders ---
-    order_ids = []
-    for _ in range(500):
-        uid = random.choice(user_ids)
+    # --- Сотрудники (80 человек) ---
+    employee_ids = []
+    for _ in range(80):
+        dob = fake.date_of_birth(minimum_age=22, maximum_age=62).strftime('%d.%m.%Y')
+        passport = (f'{random.randint(1000,9999)} '
+                    f'{random.randint(100000,999999)}')
+        phone = f'+79{random.randint(100000000,999999999)}'
         cur.execute(
-            "INSERT INTO orders (user_id, order_number, total_amount) VALUES (%s, %s, %s) RETURNING id",
-            (uid, fake.bothify('ORD-#####'), random.uniform(100, 50000))
+            """INSERT INTO employees
+               (company_id, full_name, birth_date, email, phone, passport, snils, inn)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            (
+                random.choice(company_ids),
+                fake.name(),
+                dob,
+                fake.email(),
+                phone,
+                passport,
+                gen_snils(),
+                gen_inn12(),
+            )
         )
-        order_ids.append(cur.fetchone()[0])
+        employee_ids.append(cur.fetchone()[0])
+    print(f'   ✓ Сотрудники: {len(employee_ids)}')
 
-    # --- 4. Payments ---
-    for oid in order_ids:
-        cc = fake.credit_card_number()
+    # --- Зарплатная ведомость ---
+    for eid in employee_ids:
         cur.execute(
-            "INSERT INTO payments (order_id, payment_method, credit_card_number, transaction_status) VALUES (%s, %s, %s, %s)",
-            (oid, "Credit Card", cc, "SUCCESS")
+            'INSERT INTO payroll (employee_id, card_number, iban, salary) VALUES (%s,%s,%s,%s)',
+            (
+                eid,
+                fake.credit_card_number(),          # Faker генерирует Luhn-корректные номера
+                fake.iban(),
+                round(random.uniform(60_000, 350_000), 2),
+            )
         )
+    print(f'   ✓ Зарплатная ведомость: {len(employee_ids)} записей')
 
-    # --- 5. Support Tickets ---
-    for _ in range(150):
-        uid = random.choice(user_ids)
-        msg = fake.text()
-        if random.random() < 0.3:
-            msg += f"\nМой номер: +79{random.randint(100000000, 999999999)}"
-        if random.random() < 0.2:
-            msg += f"\nПаспорт забыл: {random.randint(1000,9999)} {random.randint(100000,999999)}"
-
+    # --- Системные аккаунты ---
+    # 60 с BCrypt-хэшем, 20 с MD5 (для демонстрации разных типов)
+    for i, eid in enumerate(employee_ids):
+        pwd_hash = gen_bcrypt_like() if i < 60 else gen_md5()
         cur.execute(
-            "INSERT INTO support_tickets (user_id, subject, message_body, status) VALUES (%s, %s, %s, %s)",
-            (uid, "Проблема с заказом", msg, "OPEN")
+            """INSERT INTO system_accounts
+               (employee_id, login, password_hash, api_key, last_ip)
+               VALUES (%s,%s,%s,%s,%s)""",
+            (
+                eid,
+                fake.user_name(),
+                pwd_hash,
+                gen_api_key(),
+                gen_ipv4(),
+            )
         )
+    print(f'   ✓ Системные аккаунты: {len(employee_ids)} записей')
 
     conn.commit()
-    print("✅ Данные сгенерированы.")
+    print('✅ Данные сохранены.')
 
-if __name__ == "__main__":
+
+# ── Точка входа ───────────────────────────────────────────────
+
+if __name__ == '__main__':
     try:
-        # 1. Соединяемся и наполняем данными
         conn = psycopg2.connect(**DB_CONFIG)
-        cur = conn.cursor()
+        cur  = conn.cursor()
         create_schema(cur)
         generate_data(conn, cur)
         cur.close()
         conn.close()
-        
-        # 2. ВАЖНО: Инициализируем систему безопасности (Схемы, Триггеры, Процедуры)
-        # Передаём DB_CONFIG явно — не используем глобальный конфиг backend
-        print("🛡️ Применяю патч безопасности...")
+
+        print('🛡️  Применяю патч безопасности (триггеры, аудит)…')
         backend.init_db_security(DB_CONFIG)
-        print("✅ Патч безопасности применён.")
+
+        print('🔐 Инициализирую auth (пользователи приложения)…')
+        backend.init_auth_db(DB_CONFIG)
+
+        print('🎉 Seed завершён. Приложение готово к демонстрации.')
+        print('   Логин: admin / admin123')
 
     except Exception as e:
-        print(f"❌ Ошибка в скрипте seed: {e}")
+        print(f'❌ Ошибка seed: {e}')
+        raise

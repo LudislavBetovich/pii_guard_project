@@ -1,0 +1,21 @@
+body { font-size: .93rem; }
+
+.nav-active {
+  border-bottom: 2px solid #28a745;
+  font-weight: 600;
+}
+
+.navbar-brand { font-size: 1.1rem; letter-spacing: .02em; }
+
+.card-header { font-size: .82rem; letter-spacing: .03em; }
+
+/* Sticky thead в таблицах */
+.sticky-top { position: sticky; top: 0; z-index: 2; }
+
+/* SVG от Graphviz — масштабируется по ширине */
+svg { max-width: 100%; height: auto; }
+
+/* Danger Zone */
+.border-danger .card-header { background-color: #dc3545 !important; }
+
+code { font-size: .82em; }

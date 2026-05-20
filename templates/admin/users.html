@@ -1,0 +1,155 @@
+{% extends "base.html" %}
+{% block title %}Управление пользователями{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+
+  <!-- Список пользователей -->
+  <div class="col-lg-8">
+    <div class="card shadow-sm">
+      <div class="card-header bg-dark text-white d-flex align-items-center gap-2">
+        <i class="bi bi-people-fill"></i>
+        <strong>Пользователи системы</strong>
+        <span class="badge bg-secondary ms-auto">{{ users|length }}</span>
+      </div>
+      <div class="card-body p-0">
+        <table class="table table-hover table-sm mb-0">
+          <thead class="table-dark sticky-top">
+            <tr>
+              <th>ID</th>
+              <th>Логин</th>
+              <th>Роль</th>
+              <th>Создан</th>
+              <th>Статус</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for uid, uname, role, created_at, is_active in users %}
+            <tr class="{% if not is_active %}table-secondary text-muted{% endif %}">
+              <td class="text-muted">{{ uid }}</td>
+              <td>
+                <i class="bi bi-person-fill me-1"></i>{{ uname }}
+                {% if uid == session.user_id %}
+                  <span class="badge bg-info ms-1">вы</span>
+                {% endif %}
+              </td>
+              <td>
+                <span class="badge
+                  {% if role == 'admin' %}bg-danger
+                  {% elif role == 'analyst' %}bg-primary
+                  {% else %}bg-secondary{% endif %}">
+                  {{ role }}
+                </span>
+              </td>
+              <td class="text-muted small">{{ created_at.strftime('%d.%m.%Y %H:%M') if created_at else '—' }}</td>
+              <td>
+                {% if is_active %}
+                  <span class="badge bg-success">активен</span>
+                {% else %}
+                  <span class="badge bg-secondary">отключён</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if is_active and uid != session.user_id %}
+                <form method="post" action="/admin/users/delete"
+                      onsubmit="return confirm('Деактивировать пользователя {{ uname }}?')">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <input type="hidden" name="user_id" value="{{ uid }}">
+                  <button class="btn btn-sm btn-outline-danger py-0">
+                    <i class="bi bi-person-x"></i>
+                  </button>
+                </form>
+                {% endif %}
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" class="text-center text-muted py-3">Нет пользователей</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Форма создания -->
+  <div class="col-lg-4">
+    <div class="card shadow-sm">
+      <div class="card-header bg-dark text-white">
+        <i class="bi bi-person-plus-fill me-1"></i><strong>Новый пользователь</strong>
+      </div>
+      <div class="card-body">
+        <form method="post" action="/admin/users/create">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <div class="mb-3">
+            <label class="form-label fw-semibold">Логин</label>
+            <input type="text" name="username" class="form-control"
+                   placeholder="username" required>
+          </div>
+          <div class="mb-3">
+            <label class="form-label fw-semibold">Пароль</label>
+            <input type="password" name="password" class="form-control"
+                   placeholder="минимум 6 символов" required>
+          </div>
+          <div class="mb-4">
+            <label class="form-label fw-semibold">Роль</label>
+            <select name="role" class="form-select">
+              <option value="viewer">viewer — только просмотр</option>
+              <option value="analyst">analyst — сканирование и разметка</option>
+              <option value="admin">admin — полный доступ</option>
+            </select>
+          </div>
+          <button type="submit" class="btn btn-success w-100">
+            <i class="bi bi-plus-circle me-1"></i>Создать
+          </button>
+        </form>
+      </div>
+    </div>
+
+    <!-- Матрица прав -->
+    <div class="card shadow-sm mt-3">
+      <div class="card-header bg-dark text-white">
+        <i class="bi bi-shield-check me-1"></i><strong>Матрица прав</strong>
+      </div>
+      <div class="card-body p-0">
+        <table class="table table-sm mb-0 text-center">
+          <thead class="table-secondary">
+            <tr><th class="text-start">Действие</th><th>admin</th><th>analyst</th><th>viewer</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="text-start">Подключение</td>
+              <td><i class="bi bi-check-circle-fill text-success"></i></td>
+              <td><i class="bi bi-check-circle-fill text-success"></i></td>
+              <td><i class="bi bi-check-circle-fill text-success"></i></td></tr>
+            <tr><td class="text-start">Сканирование</td>
+              <td><i class="bi bi-check-circle-fill text-success"></i></td>
+              <td><i class="bi bi-check-circle-fill text-success"></i></td>
+              <td><i class="bi bi-x-circle-fill text-danger"></i></td></tr>
+            <tr><td class="text-start">Просмотр результатов</td>
+              <td><i class="bi bi-check-circle-fill text-success"></i></td>
+              <td><i class="bi bi-check-circle-fill text-success"></i></td>
+              <td><i class="bi bi-check-circle-fill text-success"></i></td></tr>
+            <tr><td class="text-start">Маскирование / Дамп</td>
+              <td><i class="bi bi-check-circle-fill text-success"></i></td>
+              <td><i class="bi bi-x-circle-fill text-danger"></i></td>
+              <td><i class="bi bi-x-circle-fill text-danger"></i></td></tr>
+            <tr><td class="text-start">Data Governance</td>
+              <td><i class="bi bi-check-circle-fill text-success"></i></td>
+              <td><i class="bi bi-check-circle-fill text-success"></i></td>
+              <td><i class="bi bi-x-circle-fill text-danger"></i></td></tr>
+            <tr><td class="text-start">Журнал аудита</td>
+              <td><i class="bi bi-check-circle-fill text-success"></i></td>
+              <td><i class="bi bi-check-circle-fill text-success"></i></td>
+              <td><i class="bi bi-check-circle-fill text-success"></i></td></tr>
+            <tr><td class="text-start">Управление польз.</td>
+              <td><i class="bi bi-check-circle-fill text-success"></i></td>
+              <td><i class="bi bi-x-circle-fill text-danger"></i></td>
+              <td><i class="bi bi-x-circle-fill text-danger"></i></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+</div>
+{% endblock %}

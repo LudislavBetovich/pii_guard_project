@@ -1,36 +1,29 @@
-# Используем легкий образ Python
 FROM python:3.10-slim-bookworm
 
-# Устанавливаем рабочую директорию
 WORKDIR /app
 
-# 1. Устанавливаем системные зависимости
-# graphviz - для схем
-# fonts-dejavu - шрифт для PDF (вместо скачивания wget-ом)
 RUN apt-get update && apt-get install -y \
     graphviz \
     fonts-dejavu \
     postgresql-client \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Создаем ссылку на шрифт
-# Пакет ставит шрифт в /usr/share/..., а наш скрипт ищет его в корне /app.
-# Делаем "обманку" (symlink), чтобы код не переписывать.
 RUN ln -s /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf /app/DejaVuSans.ttf
 
-# 3. Копируем зависимости python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 4. Копируем код приложения и SQL скрипты
 COPY . .
 
-# 5. Открываем порт Streamlit
-EXPOSE 8501
+EXPOSE 5000
 
-# 6. Healthcheck (проверка жизни приложения)
-HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health || exit 1
+# /login доступен без сессии и всегда возвращает 200 — годится для healthcheck.
+# Корень редиректит на /scan, /scan требует логина и отдаёт 302, что для --fail означает успех (3xx).
+HEALTHCHECK --interval=15s --timeout=5s --retries=4 \
+  CMD curl --fail http://localhost:5000/login || exit 1
 
-# 7. Запуск приложения
-# Сначала наполняем БД, потом запускаем интерфейс
-ENTRYPOINT ["sh", "-c", "python seed_data_relational.py && streamlit run app.py --server.port=8501 --server.address=0.0.0.0"]
+# По умолчанию запускаем под gunicorn — Flask dev server не годится для проды
+# (single-threaded, без graceful reload, утечки трассбэков при дебаг-ошибках).
+# Переменная APP_RUNNER=flask переключает обратно на app.run() для отладки.
+CMD ["sh", "-c", "python seed_data_relational.py && if [ \"$APP_RUNNER\" = flask ]; then python app.py; else gunicorn --workers ${GUNICORN_WORKERS:-2} --bind 0.0.0.0:5000 --access-logfile - --error-logfile - app:app; fi"]

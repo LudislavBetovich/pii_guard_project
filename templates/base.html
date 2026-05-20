@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token() }}">
+  <title>PII Guard — {% block title %}{% endblock %}</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+  <link href="{{ url_for('static', filename='style.css') }}" rel="stylesheet">
+</head>
+<body class="bg-light">
+
+<nav class="navbar navbar-dark bg-dark px-3 py-2">
+  <a class="navbar-brand fw-bold me-4" href="/">
+    <i class="bi bi-shield-fill-check text-success"></i> PII Guard
+  </a>
+  <div class="d-flex gap-1 me-auto">
+    <a href="/scan"       class="nav-link text-white px-3 {% if request.path.startswith('/scan') or request.path == '/results' %}nav-active{% endif %}">
+      <i class="bi bi-radar"></i> Сканер
+    </a>
+    <a href="/explore"    class="nav-link text-white px-3 {% if request.path.startswith('/explore') %}nav-active{% endif %}">
+      <i class="bi bi-diagram-3"></i> Исследование
+    </a>
+    <a href="/governance" class="nav-link text-white px-3 {% if request.path == '/governance' %}nav-active{% endif %}">
+      <i class="bi bi-tags"></i> Разметка
+    </a>
+    <a href="/audit"      class="nav-link text-white px-3 {% if request.path == '/audit' %}nav-active{% endif %}">
+      <i class="bi bi-journal-text"></i> Аудит
+    </a>
+    <a href="/security"   class="nav-link text-white px-3 {% if request.path.startswith('/security') %}nav-active{% endif %}">
+      <i class="bi bi-shield-exclamation"></i> Безопасность
+    </a>
+    {% if session.user_role == 'admin' %}
+    <a href="/admin/users" class="nav-link text-white px-3 {% if request.path.startswith('/admin') %}nav-active{% endif %}">
+      <i class="bi bi-people"></i> Пользователи
+    </a>
+    {% endif %}
+  </div>
+  <div class="d-flex align-items-center gap-2">
+    {% if session.db_config %}
+      <span class="badge bg-success">
+        <i class="bi bi-circle-fill me-1" style="font-size:.5rem"></i>{{ session.db_config.dbname }}
+      </span>
+      <form action="/connect/disconnect" method="post" class="mb-0">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="btn btn-sm btn-outline-light">Отключить БД</button>
+      </form>
+    {% else %}
+      <a href="/connect" class="btn btn-sm btn-warning">Подключиться</a>
+    {% endif %}
+    <span class="badge {% if session.user_role == 'admin' %}bg-danger{% elif session.user_role == 'analyst' %}bg-primary{% else %}bg-secondary{% endif %} ms-2">
+      <i class="bi bi-person-fill me-1"></i>{{ session.username }} · {{ session.user_role }}
+    </span>
+    <a href="/logout" class="btn btn-sm btn-outline-light">
+      <i class="bi bi-box-arrow-right"></i>
+    </a>
+  </div>
+</nav>
+
+<div class="container-fluid py-4 px-4" style="max-width:1400px">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for cat, msg in messages %}
+      {# Bootstrap не знает класса alert-error — мапим в alert-danger. #}
+      {% set css_cat = 'danger' if cat == 'error' else cat %}
+      <div class="alert alert-{{ css_cat }} alert-dismissible fade show py-2" role="alert">
+        {{ msg }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+      </div>
+    {% endfor %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+  // Авто-инжект X-CSRF-Token во все same-origin write-запросы. Чтобы в каждом
+  // template не править fetch вручную.
+  (function () {
+    const meta = document.querySelector('meta[name="csrf-token"]');
+    if (!meta) return;
+    const token = meta.getAttribute('content') || '';
+    const origFetch = window.fetch;
+    const writeMethods = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+    window.fetch = function (resource, init) {
+      init = init || {};
+      const method = (init.method || (typeof resource === 'object' && resource.method) || 'GET').toUpperCase();
+      // Same-origin: пропускаем абсолютные URL на другие хосты.
+      let urlStr = (typeof resource === 'string') ? resource : (resource && resource.url) || '';
+      let sameOrigin = true;
+      try {
+        if (/^https?:\/\//i.test(urlStr)) {
+          sameOrigin = (new URL(urlStr)).origin === window.location.origin;
+        }
+      } catch (e) { /* ignore */ }
+      if (sameOrigin && writeMethods.has(method)) {
+        const headers = new Headers(init.headers || {});
+        if (!headers.has('X-CSRF-Token')) headers.set('X-CSRF-Token', token);
+        init.headers = headers;
+      }
+      return origFetch.call(this, resource, init);
+    };
+  })();
+</script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,178 @@
+{% extends "base.html" %}
+{% block title %}Журнал аудита{% endblock %}
+
+{% block content %}
+<ul class="nav nav-tabs mb-3" id="auditTabs">
+  <li class="nav-item">
+    <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tabApp">
+      <i class="bi bi-app-indicator"></i> Логи приложения
+    </button>
+  </li>
+  <li class="nav-item">
+    <button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabDb">
+      <i class="bi bi-database-check"></i> Триггеры БД
+    </button>
+  </li>
+</ul>
+
+<div class="tab-content">
+
+  <!-- App logs -->
+  <div class="tab-pane fade show active" id="tabApp">
+    <div class="card shadow-sm">
+      <div class="card-header bg-dark text-white small">
+        <i class="bi bi-journal-text"></i> Журнал событий приложения
+      </div>
+      <div class="table-responsive">
+        <table class="table table-sm table-striped mb-0">
+          <thead class="table-dark"><tr>
+            <th>Дата/время</th><th>Действие</th><th>База</th><th>Детали</th>
+          </tr></thead>
+          <tbody>
+            {% if app_logs %}
+              {% for log in app_logs %}
+              <tr>
+                <td class="text-muted small">{{ log[0] }}</td>
+                <td>
+                  {% if log[1] == 'SCAN' %}
+                    <span class="badge bg-primary">SCAN</span>
+                  {% elif log[1] == 'MASK' %}
+                    <span class="badge bg-danger">MASK</span>
+                  {% else %}
+                    <span class="badge bg-secondary">{{ log[1] }}</span>
+                  {% endif %}
+                </td>
+                <td><code>{{ log[2] }}</code></td>
+                <td class="small">{{ log[3] }}</td>
+              </tr>
+              {% endfor %}
+            {% else %}
+              <tr><td colspan="4" class="text-center text-muted py-3">Логов пока нет</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- DB trigger logs -->
+  <div class="tab-pane fade" id="tabDb">
+    <div class="card shadow-sm">
+      <div class="card-header bg-dark text-white small d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-database-check"></i> Триггерный журнал PostgreSQL (pii_guard.audit_log)</span>
+        {% if connected %}
+        <button class="btn btn-sm btn-outline-light" id="btnLoadDb">
+          <i class="bi bi-arrow-clockwise"></i> Загрузить
+        </button>
+        {% else %}
+        <span class="text-warning small"><i class="bi bi-plug"></i> Нет подключения</span>
+        {% endif %}
+      </div>
+      <div id="dbLogsWrap">
+        <div class="text-muted text-center py-4 small">Нажмите «Загрузить» для получения триггерных логов</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Все ячейки строим через textContent — значения приходят из триггерного журнала
+// PostgreSQL, который содержит, помимо прочего, имена колонок/таблиц и операции,
+// потенциально подконтрольные злоумышленнику. innerHTML на этих данных = stored XSS.
+const btnDb = document.getElementById('btnLoadDb');
+if (btnDb) {
+  btnDb.addEventListener('click', async () => {
+    btnDb.disabled = true; btnDb.textContent = 'Загрузка…';
+    const wrap = document.getElementById('dbLogsWrap');
+    wrap.replaceChildren();
+
+    let r;
+    try {
+      r = await fetch('/audit/db');
+    } catch (netErr) {
+      const div = document.createElement('div');
+      div.className = 'alert alert-danger m-3';
+      div.textContent = 'Сетевая ошибка: ' + netErr.message;
+      wrap.appendChild(div);
+      btnDb.disabled = false;
+      btnDb.innerHTML = '<i class="bi bi-arrow-clockwise"></i> Обновить';
+      return;
+    }
+
+    if (!r.ok) {
+      let msg = 'HTTP ' + r.status;
+      try { const e = await r.json(); if (e && e.error) msg = e.error; } catch (_) { /* not JSON */ }
+      const div = document.createElement('div');
+      div.className = 'alert alert-danger m-3';
+      div.textContent = 'Ошибка: ' + msg;
+      wrap.appendChild(div);
+    } else {
+      const logs = await r.json();
+      if (!logs.length) {
+        const empty = document.createElement('div');
+        empty.className = 'text-muted text-center py-4 small';
+        empty.textContent = 'Триггерных событий нет';
+        wrap.appendChild(empty);
+      } else {
+        const respWrap = document.createElement('div');
+        respWrap.className = 'table-responsive';
+        const table = document.createElement('table');
+        table.className = 'table table-sm table-striped mb-0';
+        const thead = document.createElement('thead');
+        thead.className = 'table-dark';
+        const trh = document.createElement('tr');
+        ['Время', 'Пользователь БД', 'IP клиента', 'Класс', 'Таблица', 'Операция', 'Изменённые колонки', 'Детали']
+          .forEach(t => { const th = document.createElement('th'); th.textContent = t; trh.appendChild(th); });
+        thead.appendChild(trh);
+        const tbody = document.createElement('tbody');
+
+        const cellText = (txt, cls) => {
+          const td = document.createElement('td');
+          if (cls) td.className = cls;
+          td.textContent = (txt === null || txt === undefined || txt === '') ? '—' : String(txt);
+          return td;
+        };
+        const cellCode = (txt) => {
+          const td = document.createElement('td');
+          const code = document.createElement('code');
+          code.textContent = (txt === null || txt === undefined || txt === '') ? '—' : String(txt);
+          td.appendChild(code);
+          return td;
+        };
+
+        logs.forEach(l => {
+          const tr = document.createElement('tr');
+          tr.appendChild(cellText(l.time, 'text-muted small'));
+          tr.appendChild(cellCode(l.db_user || l.app_user));
+          tr.appendChild(cellCode(l.client_ip));
+          tr.appendChild(cellCode(l.event_class));
+          tr.appendChild(cellCode(l.table));
+
+          const tdOp = document.createElement('td');
+          const badge = document.createElement('span');
+          const opStr = String(l.operation || '');
+          badge.className = 'badge ' + (opStr.includes('MASK') ? 'bg-danger' : 'bg-secondary');
+          badge.textContent = opStr || '—';
+          tdOp.appendChild(badge);
+          tr.appendChild(tdOp);
+
+          tr.appendChild(cellText(l.changed_cols, 'small text-truncate'));
+          tr.appendChild(cellText(l.details, 'small text-truncate'));
+          tbody.appendChild(tr);
+        });
+
+        table.appendChild(thead);
+        table.appendChild(tbody);
+        respWrap.appendChild(table);
+        wrap.appendChild(respWrap);
+      }
+    }
+    btnDb.disabled = false;
+    btnDb.innerHTML = '<i class="bi bi-arrow-clockwise"></i> Обновить';
+  });
+}
+</script>
+{% endblock %}

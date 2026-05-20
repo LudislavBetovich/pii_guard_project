@@ -1,630 +1,698 @@
-import streamlit as st
-import pandas as pd
-import backend
-import graphviz
-import os 
+import io
+import os
+import secrets
+import threading
+from collections import Counter, defaultdict
+from functools import wraps
+from html import escape as html_escape
 
-# 1. Настройка страницы
-st.set_page_config(
-    page_title="PII Guard Enterprise",
-    page_icon="🛡️",
-    layout="wide",
-    initial_sidebar_state="expanded"
+import graphviz
+from flask import (Flask, abort, flash, jsonify, redirect, render_template,
+                   request, send_file, session, url_for)
+
+import backend
+
+app = Flask(__name__)
+app.secret_key = os.getenv('SECRET_KEY', secrets.token_hex(32))
+
+# Безопасные настройки сессионной cookie.
+# SameSite=Strict — главная защита от CSRF в современных браузерах: cookie не
+# уходит в кросс-сайтовых запросах вообще, поэтому злоумышленник со стороннего
+# сайта не сможет дёрнуть наш POST даже без CSRF-токена. HttpOnly не даёт JS
+# украсть cookie через XSS. Secure включаем, если приложение за HTTPS-прокси.
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Strict',
+    SESSION_COOKIE_SECURE=os.getenv('SESSION_COOKIE_SECURE', '0') == '1',
 )
 
-# ==========================================
-# ГЛОБАЛЬНЫЕ НАСТРОЙКИ (САЙДБАР)
-# Выносим его из вкладок, чтобы переменные были видны ВЕЗДЕ
-# ==========================================
-with st.sidebar:
-    st.header("🔌 Подключение к БД")
-    
-    # --- ФУНКЦИЯ-CALLBACK (БЕЗОПАСНАЯ) ---
-    def load_env_vars():
-        st.session_state['db_host'] = os.getenv("DB_HOST", "db")
-        st.session_state['db_port'] = os.getenv("DB_PORT", "5432")
-        st.session_state['db_name'] = os.getenv("POSTGRES_DB", "testdb")
-        st.session_state['db_user'] = os.getenv("POSTGRES_USER", "admin")
-        st.session_state['db_pass'] = os.getenv("POSTGRES_PASSWORD", "secret_password")
-        # st.rerun() НЕ НУЖЕН! Streamlit сам обновится после коллбека
 
-    # Кнопка теперь просто вызывает функцию
-    st.button("📥 Загрузить из ENV (Docker)", on_click=load_env_vars, use_container_width=True)
-
-    st.caption("Или введите вручную:")
-    
-    # Инициализация state (если пусто)
-    if 'db_host' not in st.session_state: st.session_state['db_host'] = "db"
-    if 'db_port' not in st.session_state: st.session_state['db_port'] = "5432"
-    if 'db_name' not in st.session_state: st.session_state['db_name'] = "testdb"
-    if 'db_user' not in st.session_state: st.session_state['db_user'] = "admin"
-    if 'db_pass' not in st.session_state: st.session_state['db_pass'] = "secret_password"
-    
-    # Поля ввода
-    # Поля ввода (Привязываем через key, чтобы работала кнопка ENV)
-    # Обрати внимание: мы убрали argument 'value' и поставили 'key'
-    
-    # st.text_input вернет текущее значение, но также синхронизирует его с session_state
-    st.text_input("Хост", key="db_host")
-    st.text_input("Порт", key="db_port")
-    st.text_input("База данных", key="db_name")
-    st.text_input("Пользователь", key="db_user")
-    st.text_input("Пароль", key="db_pass", type="password")
-    
-    # Важно: Так как мы используем key, значения уже лежат в st.session_state.
-    # Нам нужно достать их в локальные переменные для формирования конфига ниже.
-    db_host = st.session_state['db_host']
-    db_port = st.session_state['db_port']
-    db_name = st.session_state['db_name']
-    db_user = st.session_state['db_user']
-    db_pass = st.session_state['db_pass']
-
-    use_ssl = st.checkbox("Использовать SSL (для Render/Cloud)", value=True)
-
-    st.divider()
-    
-    scan_depth = st.slider("Глубина сканирования (строк)", min_value=100, max_value=50000, value=2000, step=100)
-
-    current_db_config = {
-        "dbname": db_name, "user": db_user, "password": db_pass,
-        "host": db_host, "port": db_port,
-    }
-    # Если галочка стоит - добавляем режим SSL
-    if use_ssl:
-        current_db_config["sslmode"] = "require"
-    # Для кнопки проверки соединения st.rerun тоже опасен, убираем его если был,
-    # но здесь у нас просто логика. Оставляем как есть, тут нет st.rerun().
-# Кнопка проверки
-    if st.button("Проверить соединение", use_container_width=True):
-        # 1. Создаем соединение
-        conn = backend.get_connection(current_db_config)
-        
-        # 2. Проверяем результат
-        if isinstance(conn, str):
-            # Если вернулась строка — это текст ошибки
-            st.error(f"❌ Ошибка: {conn}")
-        else:
-            # Если вернулся объект — успех
-            st.success("✅ Соединение установлено!")
-            # 3. Возвращаем соединение в пул (ВАЖНО!)
-            backend.close_connection(conn, current_db_config)
-            # 4. Инициализируем защиту
-            backend.init_db_security(current_db_config)
-    
-    st.info("ℹ️ Убедитесь, что Docker-контейнер базы запущен.")
+# ── CSRF (без внешних зависимостей) ──────────────────────────
+#
+# Защита: при POST/PUT/PATCH/DELETE требуем валидный csrf_token в форме или в
+# заголовке X-CSRF-Token. Токен генерируется один на сессию.
+def csrf_token() -> str:
+    tok = session.get('_csrf_token')
+    if not tok:
+        tok = secrets.token_urlsafe(32)
+        session['_csrf_token'] = tok
+    return tok
 
 
-# ==========================================
-# ОСНОВНОЙ ИНТЕРФЕЙС
-# ==========================================
-st.title("🛡️ Postgres PII Guard")
-st.markdown("### Система защиты и обезличивания персональных данных")
+@app.context_processor
+def _inject_csrf():
+    return {'csrf_token': csrf_token}
 
-# Создаем вкладки ПОСЛЕ того, как определили сайдбар и конфиг
-tab_scan, tab_explore, tab_history = st.tabs(["🚀 Сканер и Защита", "🔭 Исследование БД", "📜 Журнал Аудита"])
 
-# ==========================================
-# ВКЛАДКА 1: ОСНОВНОЙ ФУНКЦИОНАЛ
-# ==========================================
-with tab_scan:
-    # --- ЗДЕСЬ БОЛЬШЕ НЕТ st.sidebar ---
-    
-    # --- ЧАСТЬ 1: НАСТРОЙКА ОБЛАСТИ ПОИСКА ---
-    st.markdown("#### 1. Настройка области поиска (ГДЕ искать?)")
-    # ... дальше код без изменений ...
-    
-    all_tables = []
-    try:
-        # Убрали update_config(), используем backend напрямую с конфигом
-        # Но для получения списка таблиц нам нужно передать конфиг в get_all_tables
-        # (Нам придется чуть поправить backend.get_all_tables или временно оставить как есть, 
-        # но лучше поправить. Давай пока оставим try-except, чтобы не ломать логику)
-        conn_temp = backend.get_connection(current_db_config)
-        if not isinstance(conn_temp, str):
-            backend.close_connection(conn_temp, current_db_config)  # возвращаем в пул, не закрываем напрямую
-            all_tables = backend.get_all_tables(current_db_config)
-    except Exception as e:
-        print(f"Не удалось получить список таблиц: {e}")
-
-    col_white, col_info = st.columns([2, 1])
-    with col_white:
-        excluded_tables = st.multiselect(
-            "🚫 Исключить таблицы из проверки (Whitelist):",
-            options=all_tables,
-            default=[],
-            help="Выберите технические таблицы (например, migrations, logs), которые не нужно сканировать."
-        )
-    with col_info:
-        if all_tables:
-            active_count = len(all_tables) - len(excluded_tables)
-            st.metric("Таблиц для проверки", f"{active_count} / {len(all_tables)}")
-        else:
-            st.warning("Нет подключения к БД")
-
-    st.divider()
-
-    # --- ЧАСТЬ 1.5: УМНЫЙ АНАЛИЗ МЕТАДАННЫХ ---
-    st.markdown("#### 1.5. Умный анализ метаданных (Metadata Profiling)")
-    
-    with st.expander("🕵️ Проверить названия колонок (Быстрый анализ)", expanded=False):
-        st.write("Система проанализирует названия столбцов и подскажет, где точно лежат данные.")
-        
-        if st.button("🔍 Запустить анализ метаданных"):
-            hints = backend.scan_metadata_for_hints(current_db_config)
-            if not hints:
-                st.info("Подозрительных названий колонок не найдено.")
-            else:
-                st.warning(f"Найдено {len(hints)} колонок, которые судя по названию содержат перс. данные:")
-                df_hints = pd.DataFrame(hints)
-                st.dataframe(df_hints, use_container_width=True)
-                st.info("💡 Совет: Вы можете настроить эти колонки во вкладке 'Исследование БД' -> 'Разметка данных'.")
-
-# --- ЧАСТЬ 2: КОНСТРУКТОР ПАТТЕРНОВ ---
-    st.markdown("#### 2. Критерии поиска (ЧТО искать?)")
-    
-    # 0. Сначала собираем базу правил, чтобы знать ключи
-    default_patterns = backend.PII_PATTERNS
-    custom_patterns = st.session_state.get('custom_patterns', {})
-    all_available = {**default_patterns, **custom_patterns}
-    
-    # 1. Инициализируем список ВЫБРАННЫХ правил в session_state, если его нет
-    # (По умолчанию выбираем всё)
-    if 'selected_rules' not in st.session_state:
-        st.session_state['selected_rules'] = list(all_available.keys())
-
-    # Конструктор кастомных правил
-    with st.expander("➕ Добавить свой критерий поиска (Конструктор правил)"):
-        st.write("Выберите способ добавления нового правила:")
-        t_lib, t_word, t_regex = st.tabs(["📚 Библиотека шаблонов", "🔤 Поиск слова", "🤓 RegEx (Pro)"])
-        
-        # Вкладка 1: Шаблоны
-        with t_lib:
-            # Расширенная библиотека
-            PRESETS = {
-                "--- Документы РФ ---": r"", 
-                "Паспорт РФ (Серия Номер)": r"\b\d{4}[\s-]?\d{6}\b",
-                "Загранпаспорт РФ": r"\b\d{2}[\s]?\d{7}\b",
-                "СНИЛС": r"\b\d{3}[ -]?\d{3}[ -]?\d{3}[ -]?\d{2}\b",
-                "Водительское (РФ)": r"\b\d{2}[\s]?[A-ZА-Я0-9]{2}[\s]?\d{6}\b",
-                "ИНН (Физлицо)": r"\b\d{12}\b",
-                "ИНН (Юрлицо)": r"\b\d{10}\b",
-                
-                "--- Финансы ---": r"",
-                "Кредитная карта": r"\b(?:\d{4}[ -]?){3,4}\d{1,4}\b",
-                "IBAN (Счет)": r"\b[A-Z]{2}\d{2}[A-Z0-9]{4,30}\b",
-                "Bitcoin Wallet": r"\b(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,39}\b",
-                
-                "--- IT и Сети ---": r"",
-                "IP-адрес (v4)": r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
-                "MAC-адрес": r"\b([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})\b",
-                "JWT Token (Auth)": r"eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+",
-                "AWS API Key": r"AKIA[0-9A-Z]{16}",
-                
-                "--- Общее ---": r"",
-                "Дата рождения (ДД.ММ.ГГГГ)": r"\d{2}\.\d{2}\.\d{4}",
-                "Email адрес": r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"
-            }
-            
-            c1, c2 = st.columns([3, 1])
-            with c1:
-                sel_preset = st.selectbox("Выберите готовый шаблон:", list(PRESETS.keys()))
-            with c2:
-                st.write("") 
-                st.write("") 
-                if st.button("Добавить шаблон"):
-                    val = PRESETS[sel_preset]
-                    if val == r"":
-                        st.warning("Это разделитель.")
-                    else:
-                        if 'custom_patterns' not in st.session_state: st.session_state['custom_patterns'] = {}
-                        st.session_state['custom_patterns'][sel_preset] = val
-                        
-                        # --- FIX: Добавляем новый шаблон в список ВЫБРАННЫХ, не сбрасывая остальные ---
-                        if sel_preset not in st.session_state['selected_rules']:
-                            st.session_state['selected_rules'].append(sel_preset)
-                            
-                        st.success(f"✅ '{sel_preset}' добавлен!")
-                        st.rerun()
-
-        # Вкладка 2: Простое слово
-        with t_word:
-            c1, c2 = st.columns([3, 1])
-            with c1:
-                word_input = st.text_input("Введите слово или фразу (например: 'Секретно')")
-            with c2:
-                st.write("")
-                st.write("")
-                if st.button("Добавить слово") and word_input:
-                    import re
-                    name_key = f"Word: {word_input}"
-                    if 'custom_patterns' not in st.session_state: st.session_state['custom_patterns'] = {}
-                    st.session_state['custom_patterns'][name_key] = re.escape(word_input)
-                    
-                    # --- FIX: Добавляем в выбранные ---
-                    if name_key not in st.session_state['selected_rules']:
-                        st.session_state['selected_rules'].append(name_key)
-                        
-                    st.success(f"✅ Поиск '{word_input}' добавлен!")
-                    st.rerun()
-
-        # Вкладка 3: RegEx
-        with t_regex:
-            with st.form("custom_regex"):
-                r_name = st.text_input("Название правила")
-                r_val = st.text_input("RegEx паттерн")
-                if st.form_submit_button("Добавить"):
-                    if r_name and r_val:
-                        if 'custom_patterns' not in st.session_state: st.session_state['custom_patterns'] = {}
-                        st.session_state['custom_patterns'][r_name] = r_val
-                        
-                        # --- FIX: Добавляем в выбранные ---
-                        if r_name not in st.session_state['selected_rules']:
-                            st.session_state['selected_rules'].append(r_name)
-                            
-                        st.success("✅ RegEx добавлен!")
-                        st.rerun()
-
-    # Сборка всех правил (обновляем после добавлений)
-    default_patterns = backend.PII_PATTERNS
-    custom_patterns = st.session_state.get('custom_patterns', {})
-    all_available = {**default_patterns, **custom_patterns}
-    
-    # --- FIX: Используем параметр KEY вместо DEFAULT ---
-    # Streamlit теперь сам следит за переменной selected_rules
-    selected_pattern_names = st.multiselect(
-        "✅ Активные правила сканирования:",
-        options=all_available.keys(),
-        key='selected_rules' 
+@app.before_request
+def _csrf_protect():
+    if request.method not in ('POST', 'PUT', 'PATCH', 'DELETE'):
+        return
+    # Дать /static спокойно работать (хотя static обычно GET).
+    if request.endpoint == 'static':
+        return
+    expected = session.get('_csrf_token')
+    sent = (
+        request.form.get('csrf_token')
+        or request.headers.get('X-CSRF-Token')
     )
-    final_patterns = {k: all_available[k] for k in selected_pattern_names if k in all_available}
+    if not sent and request.is_json:
+        body = request.get_json(silent=True) or {}
+        sent = body.get('csrf_token') if isinstance(body, dict) else None
+    if not expected or not sent or not secrets.compare_digest(expected, sent):
+        # Не палим деталей; для JSON-клиента отдаём JSON, для HTML — 400.
+        if request.is_json or request.accept_mimetypes.best == 'application/json':
+            return jsonify({'error': 'CSRF token missing or invalid'}), 400
+        abort(400)
 
-    st.divider()
 
-    # --- ЧАСТЬ 3: ЗАПУСК ---
-    col_run_info, col_run_btn = st.columns([3, 1])
-    
-    with col_run_info:
-        st.info(f"Готов к сканированию. Активных правил: **{len(final_patterns)}**. Таблиц: **{len(all_tables) - len(excluded_tables)}**.")
-    
-    with col_run_btn:
-        start_scan = st.button("🚀 ЗАПУСТИТЬ СКАНИРОВАНИЕ", type="primary", use_container_width=True)
+# ── Security headers (defense in depth) ──────────────────────
+#
+# CSP ограничивает источники, с которых браузер вообще исполнит скрипты и
+# подгрузит ресурсы. Даже если где-то remained XSS-вектор, который мы
+# пропустили, инлайн-script в нашем HTML вписан "своими руками" — поэтому
+# 'unsafe-inline' в script-src нужен для существующих <script>-блоков; чтобы
+# его убрать, надо нонсить каждый блок, что для дипломного проекта избыточно.
+@app.after_request
+def _security_headers(response):
+    response.headers.setdefault(
+        'Content-Security-Policy',
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "font-src 'self' https://cdn.jsdelivr.net data:; "
+        "img-src 'self' data: https://img.shields.io; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'"
+    )
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('X-Frame-Options', 'DENY')
+    response.headers.setdefault('Referrer-Policy', 'same-origin')
+    return response
 
-    if start_scan:
-        if not final_patterns:
-            st.error("❌ Вы не выбрали ни одного правила!")
+# ── Состояние фонового сканирования (единственный пользователь — дипломный стенд) ──
+_scan_lock = threading.Lock()
+_scan_state: dict = {
+    'status': 'idle',   # idle | running | done | error
+    'progress': 0,
+    'total': 0,
+    'current_table': '',
+    'current_col': '',
+    'results': [],
+    'error': None,
+}
+
+
+def _db() -> dict | None:
+    """Конфиг БД из сессии или None."""
+    return session.get('db_config')
+
+
+# ── Аутентификация и RBAC ────────────────────────────────────
+
+@app.before_request
+def _require_login():
+    """Все роуты, кроме /login и /static, требуют аутентификации.
+    Намеренно НЕ открываем /logout (его делать без сессии бессмысленно).
+    request.endpoint == None (неизвестный URL) тоже валит на логин — это OK."""
+    open_endpoints = {'login', 'static'}
+    if request.endpoint in open_endpoints:
+        return
+    if 'user_id' not in session:
+        # AJAX/JSON-вызовы получают 401, чтобы фронт мог корректно отреагировать.
+        if request.is_json or request.accept_mimetypes.best == 'application/json':
+            return jsonify({'error': 'Auth required'}), 401
+        return redirect(url_for('login'))
+
+
+def role_required(*roles):
+    """Декоратор: проверяет роль текущего пользователя."""
+    def decorator(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            if session.get('user_role') not in roles:
+                abort(403)
+            return f(*args, **kwargs)
+        return decorated
+    return decorator
+
+
+# ══════════════════════════════════════════════
+#  АУТЕНТИФИКАЦИЯ
+# ══════════════════════════════════════════════
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if 'user_id' in session:
+        return redirect(url_for('scan'))
+    error = None
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        try:
+            result = backend.verify_user(username, password)
+        except backend.AuthBackendError as e:
+            # БД легла — это не неверные креды. В audit log это не пишем,
+            # чтобы не забивать дашборд ложными LOGIN_FAILED.
+            print(f"Auth backend down: {e}")
+            error = 'Сервис временно недоступен, попробуйте позже'
+            return render_template('login.html', error=error)
+
+        if result:
+            user_id, role = result
+            # Защита от session fixation: подменяем session id, выбрасывая всё,
+            # что мог положить туда атакующий до логина. csrf_token при следующем
+            # обращении пересоздастся.
+            session.clear()
+            session['user_id']   = user_id
+            session['username']  = username
+            session['user_role'] = role
+            backend.log_auth_event('LOGIN', f'Пользователь {username} ({role}) вошёл в систему')
+            return redirect(url_for('scan'))
         else:
-            progress_bar = st.progress(0, text="🔍 Подготовка к сканированию...")
-            status_placeholder = st.empty()
+            backend.log_auth_event('LOGIN_FAILED', f'Неудачная попытка входа: {username}')
+            error = 'Неверный логин или пароль'
+    return render_template('login.html', error=error)
 
-            def update_progress(idx, total, table, col):
-                pct = int((idx / max(total, 1)) * 100)
-                progress_bar.progress(pct, text=f"🔍 Сканирую: **{table}.{col}** ({idx}/{total})")
-                status_placeholder.caption(f"Таблица: `{table}` | Колонка: `{col}`")
 
+@app.route('/logout')
+def logout():
+    username = session.get('username', 'unknown')
+    backend.log_auth_event('LOGOUT', f'Пользователь {username} вышел из системы')
+    session.clear()
+    return redirect(url_for('login'))
+
+
+# ── Управление пользователями (только admin) ─────────────────
+
+@app.route('/admin/users')
+@role_required('admin')
+def admin_users():
+    users = backend.list_users()
+    return render_template('admin/users.html', users=users)
+
+
+@app.route('/admin/users/create', methods=['POST'])
+@role_required('admin')
+def admin_users_create():
+    username = request.form.get('username', '').strip()
+    password = request.form.get('password', '')
+    role     = request.form.get('role', 'viewer')
+    if not username or not password:
+        flash('Логин и пароль обязательны', 'danger')
+    elif backend.create_user(username, password, role):
+        flash(f'Пользователь «{username}» создан', 'success')
+    else:
+        flash('Ошибка: пользователь уже существует или недопустимая роль', 'danger')
+    return redirect(url_for('admin_users'))
+
+
+@app.route('/admin/users/delete', methods=['POST'])
+@role_required('admin')
+def admin_users_delete():
+    uid = request.form.get('user_id', type=int)
+    if not uid or uid == session.get('user_id'):
+        flash('Нельзя деактивировать текущего пользователя', 'danger')
+    elif backend.delete_user(uid):
+        flash('Пользователь деактивирован', 'success')
+    else:
+        # delete_user возвращает False для последнего admin или несуществующего пользователя.
+        flash('Деактивация отклонена: либо это последний активный admin, либо пользователь не найден', 'danger')
+    return redirect(url_for('admin_users'))
+
+
+# ══════════════════════════════════════════════
+#  ПОДКЛЮЧЕНИЕ
+# ══════════════════════════════════════════════
+
+@app.route('/')
+def index():
+    return redirect(url_for('scan'))
+
+
+@app.route('/connect', methods=['GET', 'POST'])
+def connect():
+    error = None
+    if request.method == 'POST':
+        cfg = {
+            'host':     request.form.get('host', 'localhost'),
+            'port':     request.form.get('port', '5432'),
+            'dbname':   request.form.get('dbname', ''),
+            'user':     request.form.get('user', ''),
+            'password': request.form.get('password', ''),
+        }
+        if request.form.get('ssl') == 'on':
+            cfg['sslmode'] = 'require'
+
+        conn = backend.get_connection(cfg)
+        if isinstance(conn, str):
+            error = conn
+        else:
+            backend.close_connection(conn, cfg)
+            backend.init_db_security(cfg)
+            session['db_config'] = cfg
+            return redirect(url_for('scan'))
+
+    return render_template('connect.html', error=error)
+
+
+@app.route('/connect/env')
+def connect_env():
+    """Вернуть настройки из ENV (для кнопки «Загрузить из Docker»)."""
+    return jsonify({
+        'host':     os.getenv('DB_HOST', 'db'),
+        'port':     os.getenv('DB_PORT', '5432'),
+        'dbname':   os.getenv('POSTGRES_DB', 'testdb'),
+        'user':     os.getenv('POSTGRES_USER', 'admin'),
+        'password': os.getenv('POSTGRES_PASSWORD', 'secret_password'),
+    })
+
+
+@app.route('/connect/test', methods=['POST'])
+def connect_test():
+    data = request.get_json(force=True)
+    cfg = {k: data.get(k, '') for k in ('host', 'port', 'dbname', 'user', 'password')}
+    if data.get('ssl'):
+        cfg['sslmode'] = 'require'
+    conn = backend.get_connection(cfg)
+    if isinstance(conn, str):
+        return jsonify({'ok': False, 'message': conn})
+    backend.close_connection(conn, cfg)
+    return jsonify({'ok': True, 'message': 'Соединение установлено!'})
+
+
+@app.route('/connect/disconnect', methods=['POST'])
+def disconnect():
+    session.pop('db_config', None)
+    return redirect(url_for('connect'))
+
+
+# ══════════════════════════════════════════════
+#  СКАНИРОВАНИЕ
+# ══════════════════════════════════════════════
+
+@app.route('/scan')
+def scan():
+    cfg = _db()
+    if not cfg:
+        return redirect(url_for('connect'))
+    tables = backend.get_all_tables(cfg)
+    custom = session.get('custom_patterns', {})
+    return render_template('scan.html',
+                           tables=tables,
+                           patterns=backend.PII_PATTERNS,
+                           custom_patterns=custom,
+                           db_name=cfg.get('dbname', ''))
+
+
+@app.route('/scan/metadata')
+def scan_metadata():
+    cfg = _db()
+    if not cfg:
+        return jsonify({'error': 'Not connected'}), 401
+    hints = backend.scan_metadata_for_hints(cfg)
+    return jsonify(hints)
+
+
+@app.route('/scan/start', methods=['POST'])
+def scan_start():
+    cfg = _db()
+    if not cfg:
+        return jsonify({'error': 'Not connected'}), 401
+
+    data = request.get_json(force=True)
+    excluded       = data.get('excluded_tables', [])
+    selected_names = data.get('selected_patterns', list(backend.PII_PATTERNS.keys()))
+    custom         = data.get('custom_patterns', {})
+    limit_rows     = int(data.get('limit_rows', 2000))
+
+    all_pats     = {**backend.PII_PATTERNS, **custom}
+    active_pats  = {k: all_pats[k] for k in selected_names if k in all_pats}
+
+    with _scan_lock:
+        if _scan_state['status'] == 'running':
+            return jsonify({'error': 'Scan already running'}), 409
+        _scan_state.update(status='running', progress=0, total=0,
+                           current_table='', current_col='',
+                           results=[], error=None)
+
+    def _run():
+        def _cb(idx, total, table, col):
+            with _scan_lock:
+                _scan_state.update(progress=idx, total=total,
+                                   current_table=table, current_col=col)
+        try:
             results = backend.scan_database(
-                excluded_tables,
-                final_patterns,
-                db_config=current_db_config,
-                limit_rows=scan_depth,
-                progress_callback=update_progress
+                excluded_tables=excluded,
+                active_patterns=active_pats,
+                db_config=cfg,
+                limit_rows=limit_rows,
+                progress_callback=_cb,
             )
-            progress_bar.progress(100, text=f"✅ Сканирование завершено! Найдено: {len(results)}")
-            status_placeholder.empty()
-            st.session_state['scan_results'] = results
-            log_msg = f"Найдено {len(results)} объектов. Таблиц: {len(all_tables)-len(excluded_tables)}."
-            backend.log_event("SCAN", db_name, log_msg)
+            backend.log_event('SCAN', cfg.get('dbname', ''),
+                              f'Найдено {len(results)} объектов')
+            with _scan_lock:
+                _scan_state.update(results=results, status='done')
+        except Exception as exc:
+            with _scan_lock:
+                _scan_state.update(status='error', error=str(exc))
 
-    # --- ЧАСТЬ 4: РЕЗУЛЬТАТЫ ---
-    if 'scan_results' in st.session_state:
-        results = st.session_state['scan_results']
-        
-        st.markdown("### 📊 Результаты анализа")
-        
-        if not results:
-            st.success("🎉 Уязвимостей не найдено! (Либо сработали фильтры Ignore/Stop-words).")
-        else:
-            # 1. Метрики
-            df = pd.DataFrame(results)
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Всего находок", len(df))
-            m2.metric("Уникальных значений", df['value'].nunique())
-            m3.metric("Таблиц затронуто", df['table'].nunique())
-            m4.metric("Типов угроз", df['type'].nunique())
-            
-            # 2. График и Сводная таблица
-            st.markdown("##### Распределение по типам")
-            
-            col_chart, col_summary = st.columns([1, 1])
-            with col_chart:
-                st.bar_chart(df['type'].value_counts())
-            
-            with col_summary:
-                st.caption("Сводка по угрозам:")
-                # Группируем: Таблица + Поле + Тип = Количество
-                summary_df = df.groupby(['table', 'column', 'type']).size().reset_index(name='count')
-                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({'ok': True})
 
-            # Детальный список прячем
-            with st.expander("🕵️ Показать детальный список всех найденных строк (Raw Data)"):
-                st.dataframe(df, use_container_width=True)
-            
-            # 3. Экспорт PDF
-            st.markdown("##### 📄 Отчет")
-            col_pdf, _ = st.columns([1, 3])
-            with col_pdf:
-                if len(results) > 100:
-                    st.warning(f"⚠️ PDF содержит первые 100 из {len(results)} записей. Полный список — в таблице выше.")
-                pdf_bytes = backend.create_pdf_report(results)
-                st.download_button("📥 Скачать отчет (PDF)", pdf_bytes, "security_report.pdf", "application/pdf")
-            
-            st.divider()
-            
-            # --- 4. DANGER ZONE (ОБЕЗЛИЧИВАНИЕ) ---
-            st.subheader("🛡️ Меры реагирования")
-            
-            # Оборачиваем в красный блок (error) для привлечения внимания
-            with st.status("⚠️ ЗОНА ОБЕЗЛИЧИВАНИЯ (DANGER ZONE)", expanded=True, state="error"):
-                st.write("Вы собираетесь применить необратимые изменения к базе данных.")
-                
-                c_opt, c_check = st.columns([1, 1])
-                with c_opt:
-                    mask_mode = st.radio(
-                        "Метод защиты:", 
-                        ["Маскирование (****)", "Синтетические данные (Faker)"],
-                        horizontal=True
-                    )
-                with c_check:
-                    st.write("") # Отступ
-                    # ПРЕДОХРАНИТЕЛЬ
-                    confirm_action = st.checkbox("Я понимаю, что данные в Production будут изменены", value=False)
-                
-                # Кнопка активна ТОЛЬКО если нажат чекбокс (disabled=not confirm_action)
-                if st.button("🧹 ЗАПУСТИТЬ ПРОЦЕСС ОБЕЗЛИЧИВАНИЯ", type="primary", use_container_width=True, disabled=not confirm_action):
-                    mode_code = 'fake' if 'Faker' in mask_mode else 'mask'
-                    
-                    with st.spinner("⏳ Применяю защиту..."):
-                        # Передаем current_db_config (как делали в Шаге 1)
-                        count = backend.mask_data(results, mode=mode_code, db_config=current_db_config)
-                    
-                    if count > 0:
-                        st.success(f"✅ Успешно! Обработано {count} записей.")
-                        st.balloons()
-                        st.session_state['scan_results'] = [] 
-                        import time
-                        time.sleep(2)
-                        st.rerun()
-                    else:
-                        st.error("Ошибка при обновлении или список угроз пуст.")
 
-            st.divider()
-            # ... (Ниже идет код "5. Экспорт Дампа", его не трогаем) ...
+@app.route('/scan/status')
+def scan_status():
+    with _scan_lock:
+        total = _scan_state['total']
+        pct   = int(_scan_state['progress'] / total * 100) if total else 0
+        return jsonify({
+            'status':        _scan_state['status'],
+            'progress':      pct,
+            'current_table': _scan_state['current_table'],
+            'current_col':   _scan_state['current_col'],
+            'count':         len(_scan_state['results']),
+            'error':         _scan_state['error'],
+        })
 
-            # 5. Экспорт Дампа (НОВОЕ)
-            st.subheader("📦 Экспорт для разработчиков (Sanitized Dump)")
-            st.markdown("Создать безопасную копию базы, обезличить её и выгрузить в SQL. **Оригинал не меняется.**")
-            
-            col_dump_mode, col_dump_btn = st.columns([2, 1])
-            with col_dump_mode:
-                dump_mode = st.radio(
-                    "Метод защиты дампа:", 
-                    ["Маскирование (****)", "Синтетические данные (Faker)"],
-                    horizontal=True,
-                    key="dump_radio"
-                )
-            
-            with col_dump_btn:
-                st.write("")
-                if st.button("🎁 СОЗДАТЬ БЕЗОПАСНЫЙ ДАМП", type="primary", use_container_width=True):
-                    d_code = 'fake' if 'Faker' in dump_mode else 'mask'
-                    with st.spinner("⏳ Клонирую БД, обезличиваю, удаляю логи и архивирую..."):
-                        # ПЕРЕДАЕМ current_db_config!
-                        dump_path = backend.generate_sanitized_dump(results, mode=d_code, db_config=current_db_config)
-                        
-                    if dump_path:
-                        st.success("✅ Дамп готов!")
-                        with open(dump_path, "rb") as f:
-                            st.download_button("📥 Скачать SQL дамп", f, "sanitized_dump.sql", "application/sql")
-                    else:
-                        st.error("Ошибка создания дампа. См. консоль.")
 
-# ==========================================
-# ВКЛАДКА 2: ИССЛЕДОВАНИЕ (EXPLORER)
-# ==========================================
-with tab_explore:
-    # Разделяем старый Explorer и новый Governance
-    sub_viz, sub_gov = st.tabs(["📊 Визуализация и Данные", "🏷️ Управление Разметкой (Data Governance)"])
-    
-    # --- ПОДВКЛАДКА 1: ВИЗУАЛИЗАЦИЯ (СТАРЫЙ ФУНКЦИОНАЛ) ---
-    with sub_viz:
-        st.header("Структура базы данных")
-        # Кнопка просто перезагружает страницу, конфиг уже в current_db_config
-        st.button("🔄 Обновить данные схемы") 
-            
-        try:
-            # Удаляем update_config() и передаем current_db_config
-            tables_list, relations = backend.get_db_schema_info(current_db_config)
-        except:
-            tables_list, relations = [], []
+# ══════════════════════════════════════════════
+#  РЕЗУЛЬТАТЫ И ОБЕЗЛИЧИВАНИЕ
+# ══════════════════════════════════════════════
 
-# Обрати внимание: теперь мы распаковываем словарь tables_dict, а не список
-        if tables_list: # Переменную можно не переименовывать, но по сути это теперь словарь
-            tables_dict = tables_list 
-            
-            # ER Диаграмма
-            with st.expander("🕸️ Визуализация связей (ER-Diagram)", expanded=True):
-                graph = graphviz.Digraph()
-                # Настройки графа для красоты
-                graph.attr(rankdir='LR', splines='ortho') 
-                graph.attr('node', shape='plaintext') # Используем HTML-стиль
-                
-                # Рисуем узлы (Таблицы + PK)
-                for table_name, pk_col in tables_dict.items():
-                    # HTML-метка для узла: Жирным имя таблицы, ниже PK
-                    pk_label = f"PK: {pk_col}" if pk_col else ""
-                    
-                    label = f'''<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" BGCOLOR="#E3F2FD">
-                        <TR><TD><B>{table_name}</B></TD></TR>
-                        <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="10" COLOR="#555555">🔑 {pk_label}</FONT></TD></TR>
-                    </TABLE>>'''
-                    
-                    graph.node(table_name, label=label)
+@app.route('/results')
+def results():
+    with _scan_lock:
+        findings = list(_scan_state['results'])
+        status   = _scan_state['status']
 
-                # Рисуем связи
-                for s, t in relations:
-                    graph.edge(s, t, label='FK', color='#888888', style='dashed')
-                    
-                st.graphviz_chart(graph)
-            
-            st.divider()
+    if not findings and status not in ('done',):
+        return redirect(url_for('scan'))
 
-  # Инспектор
-            st.subheader("🔎 Детальный анализ таблицы")
-            selected_table = st.selectbox("Выберите таблицу:", list(tables_list.keys()))
-            
-            if selected_table:
-                # Передаем конфиг сюда
-                stats = backend.get_table_statistics(selected_table, db_config=current_db_config)
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Количество строк", stats['rows'])
-                c2.metric("Размер на диске", stats['size'])
-                c3.metric("Количество колонок", len(stats['columns']))
-                
-                st.markdown("**Структура полей:**")
-                st.dataframe(pd.DataFrame(stats['columns'], columns=["Название", "Тип данных", "Может быть NULL"]), use_container_width=True)
-                
-                st.markdown(f"**👀 Предпросмотр данных ({selected_table}):**")
-                # И сюда передаем конфиг
-                sample_data = backend.get_table_sample(selected_table, db_config=current_db_config)
-                if sample_data:
-                    st.dataframe(pd.DataFrame(sample_data), use_container_width=True)
-                else:
-                    st.info("Таблица пуста.")
-        else:
-            st.warning("Нет подключения или таблиц.")
+    type_counts  = dict(Counter(f['type']  for f in findings))
+    table_counts = dict(Counter(f['table'] for f in findings))
+    validated_count = sum(1 for f in findings if f.get('validated') is True)
 
-# --- ПОДВКЛАДКА 2: DATA GOVERNANCE (НОВЫЙ ФУНКЦИОНАЛ) ---
-    with sub_gov:
-        st.header("🏷️ Разметка данных (Data Governance)")
-        st.markdown("Здесь вы можете вручную указать системе, какие колонки содержат персональные данные.")
-        
-        # 1. Загрузка данных
-        try:
-            # Получаем схему и текущие настройки
-            all_cols_info = backend.get_db_schema_details(current_db_config)
-            current_settings = backend.get_column_settings(current_db_config)
-        except:
-            all_cols_info, current_settings = [], {}
-            # st.error("Ошибка загрузки настроек") # Можно скрыть, если база не подключена
+    groups = defaultdict(int)
+    for f in findings:
+        groups[(f['table'], f['column'], f['type'])] += 1
+    summary = [{'table': t, 'column': c, 'type': tp, 'count': n}
+               for (t, c, tp), n in sorted(groups.items())]
 
-        if all_cols_info:
-            # 2. Подготовка DataFrame для редактора
-            data_list = []
-            for t_name, c_name, c_type in all_cols_info:
-                # Получаем текущий статус или дефолт
-                setting = current_settings.get((t_name, c_name), {})
-                curr_stat = setting.get('status', 'AUTO')
-                curr_type = setting.get('type', None)
-                
-                data_list.append({
-                    "Таблица": t_name,
-                    "Колонка": c_name,
-                    "Тип БД": c_type,
-                    "Статус": curr_stat,
-                    "Тип PII (если Force)": curr_type
-                })
-            
-            df_gov = pd.DataFrame(data_list)
+    return render_template('results.html',
+                           findings=findings[:500],
+                           total=len(findings),
+                           type_counts=type_counts,
+                           table_counts=table_counts,
+                           summary=summary,
+                           validated_count=validated_count)
 
-            # 3. Редактор данных (Excel-like)
-            st.info("💡 Отредактируйте статусы в таблице и нажмите 'Сохранить изменения' внизу.")
-            
-            edited_df = st.data_editor(
-                df_gov,
-                column_config={
-                    "Таблица": st.column_config.TextColumn(disabled=True),
-                    "Колонка": st.column_config.TextColumn(disabled=True),
-                    "Тип БД": st.column_config.TextColumn(disabled=True),
-                    "Статус": st.column_config.SelectboxColumn(
-                        "Режим проверки",
-                        help="AUTO: Умный поиск\nIGNORE: Не сканировать\nFORCE_PII: Считать утечкой",
-                        width="medium",
-                        options=[
-                            "AUTO",
-                            "IGNORE", 
-                            "FORCE_PII"
-                        ],
-                        required=True
-                    ),
-                    "Тип PII (если Force)": st.column_config.SelectboxColumn(
-                        "Тип данных",
-                        help="Укажите тип данных, если выбран режим FORCE_PII",
-                        width="medium",
-                        options=list(backend.PII_PATTERNS.keys()),
-                        required=False
-                    )
-                },
-                hide_index=True,
-                use_container_width=True,
-                height=500,
-                key="gov_editor"
+
+@app.route('/results/mask', methods=['POST'])
+@role_required('admin')
+def results_mask():
+    cfg = _db()
+    if not cfg:
+        return jsonify({'error': 'Not connected'}), 401
+    data = request.get_json(force=True)
+    mode = data.get('mode', 'mask')
+    with _scan_lock:
+        findings = list(_scan_state['results'])
+    count = backend.mask_data(findings, mode=mode, db_config=cfg)
+    with _scan_lock:
+        _scan_state.update(results=[], status='idle')
+    return jsonify({'ok': True, 'count': count})
+
+
+@app.route('/results/dump', methods=['POST'])
+@role_required('admin')
+def results_dump():
+    cfg = _db()
+    if not cfg:
+        return jsonify({'error': 'Not connected'}), 401
+    data = request.get_json(force=True)
+    mode = data.get('mode', 'mask')
+    with _scan_lock:
+        findings = list(_scan_state['results'])
+    path = backend.generate_sanitized_dump(findings, mode=mode, db_config=cfg)
+    if not path:
+        return jsonify({'error': 'Ошибка генерации дампа'}), 500
+    return send_file(path, as_attachment=True,
+                     download_name='sanitized_dump.sql', mimetype='application/sql')
+
+
+@app.route('/results/pdf')
+def results_pdf():
+    with _scan_lock:
+        findings = list(_scan_state['results'])
+    pdf_bytes = backend.create_pdf_report(findings)
+    return send_file(io.BytesIO(pdf_bytes), as_attachment=True,
+                     download_name='security_report.pdf', mimetype='application/pdf')
+
+
+# ══════════════════════════════════════════════
+#  ИССЛЕДОВАНИЕ БД
+# ══════════════════════════════════════════════
+
+@app.route('/explore')
+def explore():
+    cfg = _db()
+    if not cfg:
+        return redirect(url_for('connect'))
+
+    tables_info, relations = backend.get_db_schema_info(cfg)
+    svg = ''
+    if tables_info:
+        g = graphviz.Digraph()
+        g.attr(rankdir='LR', splines='ortho')
+        g.attr('node', shape='plaintext')
+        for tname, pk in tables_info.items():
+            # ER-метки рендерятся как HTML-like labels Graphviz, а итоговый SVG
+            # вставляется в страницу через {{ svg | safe }}. Без escape любая
+            # таблица/PK с символом < в имени превращается в stored XSS.
+            safe_tname = html_escape(str(tname))
+            pk_label = f'PK: {html_escape(str(pk))}' if pk else 'no PK'
+            label = (
+                f'<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" BGCOLOR="#E3F2FD">'
+                f'<TR><TD><B>{safe_tname}</B></TD></TR>'
+                f'<TR><TD ALIGN="LEFT"><FONT POINT-SIZE="10" COLOR="#555">{pk_label}</FONT></TD></TR>'
+                f'</TABLE>>'
             )
+            g.node(tname, label=label)
+        for s, t in relations:
+            g.edge(s, t, label='FK', color='#888', style='dashed')
+        try:
+            svg = g.pipe(format='svg').decode('utf-8')
+        except Exception as exc:
+            svg = f'<p class="text-danger">Graphviz error: {exc}</p>'
 
-            # 4. Кнопка сохранения
-            if st.button("💾 Сохранить изменения", type="primary"):
-                # Сравниваем и ищем изменения (или просто сохраняем всё, что проще для MVP)
-                updates = []
-                # Превращаем DF обратно в список словарей
-                for index, row in edited_df.iterrows():
-                    # Простая логика: сохраняем все строки, где статус не AUTO или где он был изменен
-                    # Для надежности в MVP сохраним просто всё, что в редакторе (upsert справится)
-                    updates.append({
-                        "table": row["Таблица"],
-                        "col": row["Колонка"],
-                        "status": row["Статус"],
-                        "type": row["Тип PII (если Force)"] if row["Статус"] == "FORCE_PII" else None
-                    })
-                
-                if updates:
-                    success = backend.save_batch_settings(updates, current_db_config)
-                    if success:
-                        st.success("✅ Настройки успешно обновлены!")
-                        import time
-                        time.sleep(1)
-                        st.rerun()
-                    else:
-                        st.error("Ошибка при сохранении.")
-        else:
-            st.warning("Нет подключения к БД или таблицы отсутствуют.")
+    return render_template('explore.html',
+                           svg=svg,
+                           table_names=list(tables_info.keys()) if tables_info else [],
+                           db_name=cfg.get('dbname', ''))
 
-# ==========================================
-# ВКЛАДКА 3: ИСТОРИЯ (АУДИТ)
-# ==========================================
-with tab_history:
-    st.header("📜 Журнал аудита безопасности")
-    tab_app_log, tab_db_log = st.tabs(["App Logs (Приложение)", "DB Triggers (Ядро БД)"])
-    
-    with tab_app_log:
-        logs = backend.get_audit_logs()
-        if logs:
-            df_logs = pd.DataFrame(logs, columns=["Дата", "Действие", "БД", "Детали"])
-            st.dataframe(df_logs, use_container_width=True)
-        else:
-            st.info("Нет логов приложения.")
 
-    with tab_db_log:
-        st.write("Логи, записанные триггерами PostgreSQL (pii_guard.audit_log).")
-        if st.button("🔄 Скачать логи с сервера БД"):
-            conn = backend.get_connection(current_db_config)
-            if not isinstance(conn, str):
-                try:
-                    df_db = pd.read_sql("SELECT event_time, db_user, table_name, operation, old_data, new_data FROM pii_guard.audit_log ORDER BY event_time DESC LIMIT 100", conn)
-                    st.session_state["db_audit_logs"] = df_db
-                except Exception as e:
-                    st.error(f"Ошибка чтения логов БД: {e}")
-                finally:
-                    backend.close_connection(conn, current_db_config)
-        if "db_audit_logs" in st.session_state:
-            st.dataframe(st.session_state["db_audit_logs"], use_container_width=True)
+@app.route('/explore/table/<name>')
+def explore_table(name):
+    cfg = _db()
+    if not cfg:
+        return jsonify({'error': 'Not connected'}), 401
+    stats  = backend.get_table_statistics(name, db_config=cfg)
+    sample = backend.get_table_sample(name, limit=5, db_config=cfg)
+    return jsonify({
+        'rows':    stats['rows'],
+        'size':    stats['size'],
+        'columns': stats['columns'],
+        'sample':  sample,
+    })
 
-st.divider()
-st.caption("Postgres PII Guard Enterprise v2.0 | Курсовая работа | 2025")
+
+# ══════════════════════════════════════════════
+#  УПРАВЛЕНИЕ РАЗМЕТКОЙ (DATA GOVERNANCE)
+# ══════════════════════════════════════════════
+
+@app.route('/governance', methods=['GET', 'POST'])
+def governance():
+    cfg = _db()
+    if not cfg:
+        return redirect(url_for('connect'))
+
+    if request.method == 'POST':
+        if session.get('user_role') not in ('admin', 'analyst'):
+            return jsonify({'error': 'Недостаточно прав'}), 403
+        data    = request.get_json(force=True)
+        updates = data.get('updates', [])
+        ok      = backend.save_batch_settings(updates, cfg)
+        return jsonify({'ok': ok})
+
+    cols_info        = backend.get_db_schema_details(cfg)
+    current_settings = backend.get_column_settings(cfg)
+    rows = []
+    for t_name, c_name, c_type in cols_info:
+        s = current_settings.get((t_name, c_name), {})
+        rows.append({
+            'table':    t_name,
+            'column':   c_name,
+            'db_type':  c_type,
+            'status':   s.get('status', 'AUTO'),
+            'pii_type': s.get('type') or '',
+        })
+
+    return render_template('governance.html',
+                           rows=rows,
+                           pii_types=list(backend.PII_PATTERNS.keys()))
+
+
+# ══════════════════════════════════════════════
+#  ЖУРНАЛ АУДИТА
+# ══════════════════════════════════════════════
+
+@app.route('/audit')
+def audit():
+    cfg      = _db()
+    app_logs = backend.get_audit_logs()
+    return render_template('audit.html',
+                           app_logs=app_logs,
+                           connected=cfg is not None)
+
+
+@app.route('/audit/db')
+def audit_db():
+    cfg = _db()
+    if not cfg:
+        return jsonify({'error': 'Not connected'}), 401
+    conn = backend.get_connection(cfg)
+    if isinstance(conn, str):
+        return jsonify({'error': conn}), 500
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT event_time, db_user, app_user, client_ip,
+                   event_class, table_name, operation, changed_cols, details
+            FROM pii_guard.audit_log
+            ORDER BY event_time DESC LIMIT 100
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        return jsonify([{
+            'time':         str(r[0]),
+            'db_user':      r[1] or '',
+            'app_user':     r[2] or '',
+            'client_ip':    r[3] or '',
+            'event_class':  r[4] or 'DATA',
+            'table':        r[5] or '',
+            'operation':    r[6] or '',
+            'changed_cols': r[7] or '',
+            'details':      r[8] or '',
+        } for r in rows])
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+    finally:
+        backend.close_connection(conn, cfg)
+
+
+# ══════════════════════════════════════════════
+#  ДАШБОРД БЕЗОПАСНОСТИ
+# ══════════════════════════════════════════════
+
+@app.route('/security')
+def security():
+    cfg = _db()
+    stats  = backend.get_security_stats(cfg) if cfg else {}
+    return render_template('security.html', stats=stats, connected=cfg is not None)
+
+
+@app.route('/security/verify')
+def security_verify():
+    cfg = _db()
+    if not cfg:
+        return jsonify({'ok': False, 'message': 'Нет подключения к БД'}), 400
+    result = backend.verify_audit_chain(cfg)
+    return jsonify(result)
+
+
+@app.route('/security/events')
+def security_events():
+    cfg = _db()
+    if not cfg:
+        return jsonify({'error': 'Not connected'}), 401
+    operation = request.args.get('operation') or None
+    db_user   = request.args.get('db_user') or None
+    date_from = request.args.get('date_from') or None
+    date_to   = request.args.get('date_to') or None
+    offset    = int(request.args.get('offset', 0))
+    rows = backend.get_security_events(
+        operation=operation, db_user=db_user,
+        date_from=date_from, date_to=date_to,
+        limit=50, offset=offset, db_config=cfg
+    )
+    return jsonify([{
+        'event_id':  r[0],
+        'time':      str(r[1]),
+        'db_user':   r[2] or '',
+        'app_user':  r[3] or '',
+        'client_ip': r[4] or '',
+        'operation': r[5] or '',
+        'details':   r[6] or '',
+        'row_hash':  (r[7] or '')[:16] + '…',
+    } for r in rows])
+
+
+# ══════════════════════════════════════════════
+#  КАСТОМНЫЕ ПАТТЕРНЫ (храним в сессии)
+# ══════════════════════════════════════════════
+
+@app.route('/patterns/add', methods=['POST'])
+def pattern_add():
+    data  = request.get_json(force=True)
+    name  = data.get('name', '').strip()
+    regex = data.get('regex', '').strip()
+    if not name or not regex:
+        return jsonify({'ok': False, 'error': 'Нужны name и regex'})
+    custom      = session.get('custom_patterns', {})
+    custom[name] = regex
+    session['custom_patterns'] = custom
+    return jsonify({'ok': True})
+
+
+@app.route('/patterns/delete', methods=['POST'])
+def pattern_delete():
+    data  = request.get_json(force=True)
+    name  = data.get('name', '')
+    custom = session.get('custom_patterns', {})
+    custom.pop(name, None)
+    session['custom_patterns'] = custom
+    return jsonify({'ok': True})
+
+
+# ══════════════════════════════════════════════
+# Инициализация при импорте модуля — нужна и для gunicorn (он не выполняет
+# __main__-блок). Защищаем флагом, чтобы воркеры gunicorn не дрались за инит.
+_INIT_DONE = False
+
+
+def _bootstrap_once():
+    global _INIT_DONE
+    if _INIT_DONE:
+        return
+    _INIT_DONE = True
+    try:
+        backend.init_db_security()
+        backend.init_auth_db()
+    except Exception as _e:
+        print(f"Startup init warning: {_e}")
+
+
+_bootstrap_once()
+
+
+if __name__ == '__main__':
+    # Локальный режим (flask dev server). В проде gunicorn импортирует
+    # модуль и пользуется _bootstrap_once() выше.
+    try:
+        backend.init_db_security()
+        backend.init_auth_db()
+    except Exception as _e:
+        print(f"Startup init warning: {_e}")
+    app.run(host='0.0.0.0', port=5000, debug=False)
